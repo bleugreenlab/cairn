@@ -306,7 +306,7 @@ fn attempt() -> MergeAttemptJournal<'static> {
     MergeAttemptJournal {
         attempt_id: "attempt-1",
         project_id: "project",
-        merge_request_id: "mr",
+        merge_request_id: Some("mr"),
         job_id: "job",
         target_ref: "main",
         source_ref: "feature/zeta",

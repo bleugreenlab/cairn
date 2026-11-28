@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
     Rebuild,
-    BumpVersion,
     LiftDrain,
     FencedCommand,
 }
@@ -15,9 +14,18 @@ impl RequestKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rebuild => "rebuild",
-            Self::BumpVersion => "bump_version",
             Self::LiftDrain => "lift_drain",
             Self::FencedCommand => "fenced_command",
+        }
+    }
+
+    /// The assurance an acceptance of this kind must carry. The kind's code
+    /// sets it, never the asker; the registry's definitions and storage's
+    /// chained-acceptance check both read it here.
+    pub const fn acceptance_policy(self) -> AcceptancePolicy {
+        match self {
+            Self::Rebuild | Self::LiftDrain => AcceptancePolicy::OperatorCredential,
+            Self::FencedCommand => AcceptancePolicy::LocalUserVerification,
         }
     }
 }
@@ -58,6 +66,21 @@ pub enum AcceptancePolicy {
     /// The desktop operator credential plus a local device-owner check (Touch
     /// ID or the Mac password) performed for this one acceptance.
     LocalUserVerification,
+}
+impl AcceptancePolicy {
+    /// Whether an acceptance that meets `self` also meets `other`.
+    /// `LocalUserVerification` is the desktop credential plus a device-owner
+    /// check, so it covers `OperatorCredential`; the reverse does not hold.
+    pub const fn covers(self, other: AcceptancePolicy) -> bool {
+        matches!(
+            (self, other),
+            (_, AcceptancePolicy::OperatorCredential)
+                | (
+                    AcceptancePolicy::LocalUserVerification,
+                    AcceptancePolicy::LocalUserVerification
+                )
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -136,6 +159,80 @@ pub struct FencedCommandTarget {
     pub timeout_ms: Option<u64>,
 }
 
+/// What an agent supplies to ask for a project-declared approved command
+/// (`approvedCommands` in `.cairn/config.yaml`) by name. The command text, the
+/// commit it is read from and what it lands are the declaration's, read at the
+/// default branch's tip, never the agent's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredCommandTarget {
+    /// The declared command's name, e.g. `bump`.
+    pub declared: String,
+    /// One value per declared param, by name.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+    /// The executor's public name. Omitted, Cairn picks the one online
+    /// executor whose credential floor and toolchains fit, and refuses when
+    /// there is not exactly one.
+    #[serde(default)]
+    pub executor: Option<String>,
+}
+
+/// A declared command as one acceptance binds it: the declaration it was
+/// expanded from (by commit and digest), every param as asked and as resolved,
+/// and what the act lands and chains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredAct {
+    pub name: String,
+    pub label: String,
+    /// The declaration's consequence with every param filled in.
+    pub consequence: String,
+    pub params: Vec<DeclaredParam>,
+    /// The default branch's tip the declaration was read from.
+    pub defined_by_commit: String,
+    /// SHA-256 of the declaration's canonical JSON encoding. Re-read at the
+    /// tip at every recheck: a changed declaration is a different act.
+    pub declaration_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lands: Option<DeclaredLands>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then: Option<RequestKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredParam {
+    pub name: String,
+    /// As the filing asked, e.g. `sm`.
+    pub requested: String,
+    /// The literal substituted into the command, e.g. `0.13.9`.
+    pub resolved: String,
+    /// For a release version: where the current version was read, and what it
+    /// read at `defined_by_commit`. A `lands` act refuses when the tip no
+    /// longer reads this value, and its sealed tree must read `resolved`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<DeclaredVersionRead>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredVersionRead {
+    pub path: String,
+    pub json_key: String,
+    pub value: String,
+}
+
+/// The one commit a declared command lands on the default branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredLands {
+    /// The repo-relative globs every sealed path must match.
+    pub paths: Vec<String>,
+    /// The commit's subject, params filled in.
+    pub message: String,
+}
+
 /// The act a `fenced_command` request names, frozen at filing. It is stored as
 /// the request's canonical target and is the coalescing identity: two filings
 /// join only when every field is equal, the requesting node included, because
@@ -153,8 +250,13 @@ pub struct FencedCommandAct {
     pub cwd: String,
     pub command: String,
     pub timeout_ms: u64,
-    /// The requesting node's home URI: whose scratch the act carries.
+    /// The requesting node's home URI: whose scratch the act carries. A
+    /// declared act carries none; the node is the filer's attribution.
     pub node: String,
+    /// Present when the act is a project-declared approved command. Omitted
+    /// when absent, so a raw act encodes byte-for-byte as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<DeclaredAct>,
 }
 
 /// The executor's credential floor as measured when the operator accepted.
@@ -229,6 +331,9 @@ pub struct FencedCommandFacts {
     pub node: String,
     /// What the act can reach, in the operator's words.
     pub consequence: String,
+    /// The declared command this card is, when it is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<DeclaredAct>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +397,16 @@ pub struct FencedCommandReport {
     /// Why the act did not run, or what the scratch write-back said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// A `lands` act's commit, now on the default branch: sealed by this
+    /// attempt, or adopted when an earlier attempt of the same act landed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_commit: Option<String>,
+    /// The commit this attempt sealed, when it sealed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_commit: Option<String>,
+    /// The default branch's tip the landed commit was sealed on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// Mandatory, versioned authority inputs. No field is inferred from prose.
@@ -324,9 +439,52 @@ pub struct RequestAcceptance {
     /// earlier kind's frozen acceptance encodes byte-for-byte as it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fenced_command: Option<FencedCommandAcceptance>,
+    /// Present on an acceptance the primitive wrote because a verified parent
+    /// act named this kind as its `then`. It is the acceptance's authority:
+    /// the copied operator and appearance are attribution only, and storage
+    /// re-verifies this provenance on every checked read. Omitted when absent,
+    /// so every operator-written acceptance encodes byte-for-byte as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chained_from: Option<ChainedFrom>,
     pub operator: PrincipalRef,
     pub appearance: AppearanceSnapshot,
     pub accepted_at: i64,
+}
+/// The operator acceptance a chained acceptance derives from: the parent
+/// attempt whose verified `Done` report named the commit, the journal event
+/// that accepted it, and the binding digest that event froze.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainedFrom {
+    pub parent_attempt_id: String,
+    pub parent_authorization_event_id: String,
+    pub parent_binding_digest: String,
+}
+
+/// Where one parent attempt's chain stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainState {
+    Pending,
+    Accepted,
+    Satisfied,
+    Refused,
+}
+
+/// What a request's read shows of a chain one of its attempts started: the
+/// request it filed and how the chain ended. A read projection only; the
+/// authority stays with the chain row and the chained acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestChainLink {
+    pub parent_attempt_id: String,
+    pub kind: RequestKind,
+    /// The commit the parent's verified report landed.
+    pub commit: String,
+    pub state: ChainState,
+    pub deadline_unix_ms: i64,
+    /// The chained request's `cairn://requests/{n}`, once it is filed.
+    pub child_request_uri: Option<String>,
+    pub refusal: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -369,6 +527,9 @@ pub struct OperatorRequest {
     pub requesters: Vec<RequestContribution>,
     pub facts: Option<RequestFacts>,
     pub attempts: Vec<RequestAttempt>,
+    /// The chains this request's attempts started, by parent attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chains: Vec<RequestChainLink>,
     pub available: bool,
     pub unavailable_reason: Option<String>,
     /// What the kind's definition requires of an acceptance.

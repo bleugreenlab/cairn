@@ -162,6 +162,28 @@ struct PublicationDetail {
     local: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     issue_generation: Option<i64>,
+    /// An operator request's intent: who landed it, in place of a merge
+    /// request. The journal writes it as the last key (`merge::journal_detail`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<JournalSubject>,
+}
+
+/// The `subject` key of an operator request's journal rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalSubject {
+    #[serde(default)]
+    operator_request: Option<OperatorRequestSubject>,
+}
+
+/// The operator request attempt a journal row belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperatorRequestSubject {
+    attempt_id: String,
+    project_id: String,
+    source: String,
+    target: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +210,7 @@ fn intent_detail(publication: &Publication) -> Result<String, String> {
         publication: publication.clone(),
         local: None,
         issue_generation: None,
+        subject: None,
     })
     .map_err(|error| format!("the publication intent is unserializable: {error}"))
 }
@@ -215,20 +238,25 @@ async fn journal_publication_intent_at(
     publication: &Publication,
     local: bool,
 ) -> Result<(), String> {
-    let generation = db
-        .query_opt(
-            "SELECT i.resolution_generation FROM merge_requests m
-           JOIN issues i ON i.id = m.issue_id WHERE m.id = ?1",
-            params![attempt.merge_request_id],
-            |row| row.i64(0),
-        )
-        .await
-        .map_err(|error| format!("landing generation is unreadable: {error}"))?;
+    // An operator request has no merge request, so no issue generation.
+    let generation = match attempt.merge_request_id {
+        None => None,
+        Some(mr_id) => db
+            .query_opt(
+                "SELECT i.resolution_generation FROM merge_requests m
+               JOIN issues i ON i.id = m.issue_id WHERE m.id = ?1",
+                params![mr_id],
+                |row| row.i64(0),
+            )
+            .await
+            .map_err(|error| format!("landing generation is unreadable: {error}"))?,
+    };
     // Keep publication first: the existing recovery census recognises this prefix.
     let detail = serde_json::to_string(&PublicationDetail {
         publication: publication.clone(),
         local: Some(local),
         issue_generation: generation,
+        subject: None,
     })
     .map_err(|error| error.to_string())?;
     journal_merge_attempt_event(
@@ -321,7 +349,14 @@ pub(super) async fn journal_accepted_publication(
 ) -> Result<(), String> {
     // A successful transport is not a successful MR record. Leaving the
     // executing intent alive is both the publication fence and recovery handle.
-    if recorded_landing(db, attempt.merge_request_id)
+    let Some(mr_id) = attempt.merge_request_id else {
+        return Err(
+            "an operator request's publication has no merge-request record to wait on; \
+                    its landing journals the outcome itself"
+                .to_string(),
+        );
+    };
+    if recorded_landing(db, mr_id)
         .await?
         .is_none_or(|landing| landing.commit != publication.landing_commit)
     {
@@ -756,7 +791,11 @@ async fn remote_history_evidence(
 struct PendingPublication {
     attempt_id: String,
     project_id: String,
-    merge_request_id: String,
+    /// `None` for an operator request's publication.
+    merge_request_id: Option<String>,
+    /// The operator request a publication with no merge request belongs to,
+    /// as its intent says.
+    request: Option<OperatorRequestSubject>,
     job_id: String,
     target_ref: String,
     source_ref: String,
@@ -765,6 +804,19 @@ struct PendingPublication {
     publication: Publication,
     local: bool,
     generation: Option<i64>,
+}
+
+/// Whether operator request attempt `attempt_id` has a publication whose
+/// outcome is not yet settled. Landing recovery settles it first; until then
+/// the request's own recovery leaves the attempt claimed.
+pub(crate) async fn request_publication_pending(
+    db: &LocalDb,
+    attempt_id: &str,
+) -> Result<bool, String> {
+    Ok(pending_publications(db, None)
+        .await?
+        .iter()
+        .any(|pending| pending.merge_request_id.is_none() && pending.job_id == attempt_id))
 }
 
 async fn pending_publications(
@@ -781,7 +833,6 @@ async fn pending_publications(
                       ORDER BY i.sequence LIMIT 1)
                FROM merge_attempt_events e
               WHERE e.state IN ('executing', 'indeterminate')
-                AND e.merge_request_id IS NOT NULL
                 AND (?1 IS NULL OR e.merge_request_id = ?1)
                 AND e.sequence = (SELECT MAX(l.sequence) FROM merge_attempt_events l
                                    WHERE l.attempt_id = e.attempt_id)
@@ -793,7 +844,7 @@ async fn pending_publications(
                 Ok((
                     row.text(0)?,
                     row.text(1)?,
-                    row.text(2)?,
+                    row.opt_text(2)?,
                     row.text(3)?,
                     row.text(4)?,
                     row.text(5)?,
@@ -833,9 +884,13 @@ async fn pending_publications(
                     .and_then(|value| value.local)
                     .unwrap_or(false);
                 let generation = metadata.as_ref().and_then(|value| value.issue_generation);
+                let request = metadata
+                    .and_then(|value| value.subject)
+                    .and_then(|subject| subject.operator_request);
                 Some(PendingPublication {
                     local,
                     generation,
+                    request,
                     attempt_id,
                     project_id,
                     merge_request_id: mr,
@@ -887,10 +942,15 @@ async fn settle_publication(
     let Some(_driving) = InFlight::try_enter(&pending.attempt_id) else {
         return Ok(LandingRecovery::Busy);
     };
+    let Some(merge_request_id) = pending.merge_request_id.as_deref() else {
+        return Ok(LandingRecovery::Undetermined(
+            "the publication names no merge request and no operator request".to_string(),
+        ));
+    };
     let journal = MergeAttemptJournal {
         attempt_id: &pending.attempt_id,
         project_id: &pending.project_id,
-        merge_request_id: &pending.merge_request_id,
+        merge_request_id: Some(merge_request_id),
         job_id: &pending.job_id,
         target_ref: &pending.target_ref,
         source_ref: &pending.source_ref,
@@ -921,13 +981,13 @@ async fn settle_publication(
         .ok_or_else(|| format!("project {} is gone", pending.project_id))?;
 
     let current = super::context::resolve_merge_mr_context_for_job(db, &pending.job_id).await?;
-    if current.mr.mr_id != pending.merge_request_id {
+    if current.mr.mr_id != merge_request_id {
         return Ok(LandingRecovery::Undetermined(
             "publication's merge request is no longer the owner's current request".to_string(),
         ));
     }
     // The row was recorded and only the journal's outcome was lost.
-    if let Some(landing) = recorded_landing(db, &pending.merge_request_id).await? {
+    if let Some(landing) = recorded_landing(db, merge_request_id).await? {
         if landing.commit == publication.landing_commit {
             recover_recorded_bookmarks(orch, db, pending, &current).await?;
             super::resolution::resolve_recorded_pr_node(
@@ -951,7 +1011,7 @@ async fn settle_publication(
         .query_opt(
             "SELECT i.resolution_generation FROM merge_requests m
            JOIN issues i ON i.id = m.issue_id WHERE m.id = ?1",
-            params![pending.merge_request_id.as_str()],
+            params![merge_request_id],
             |row| row.i64(0),
         )
         .await
@@ -995,7 +1055,7 @@ async fn settle_publication(
                     )))
                 }
             };
-            if context.mr.mr_id != pending.merge_request_id {
+            if context.mr.mr_id != merge_request_id {
                 return Ok(LandingRecovery::Undetermined(
                     "publication's owner now has a different merge request".to_string(),
                 ));
@@ -1004,7 +1064,7 @@ async fn settle_publication(
             super::resolution::resolve_recovered_landing(
                 orch,
                 &pending.job_id,
-                &pending.merge_request_id,
+                merge_request_id,
                 pending.generation,
                 recovery_attribution(db, &pending.attempt_id).await,
                 Landed {
@@ -1014,7 +1074,7 @@ async fn settle_publication(
                 },
             )
             .await?;
-            if recorded_landing(db, &pending.merge_request_id)
+            if recorded_landing(db, merge_request_id)
                 .await?
                 .is_none_or(|landing| landing.commit != commit)
             {
@@ -1042,6 +1102,89 @@ async fn settle_publication(
     }
 }
 
+/// Settle an operator request's publication from the publication evidence
+/// alone: the store's history for a local landing, origin's for a remote one.
+/// Landed journals `succeeded`, definitely not landed journals `failed`, and
+/// each releases the landing pin; an unknown outcome stays pending. No job,
+/// merge request or GitHub record is read or resolved: the request's own
+/// attempt report is its record, and its consumer's recovery reads this
+/// outcome.
+async fn settle_request_publication(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    pending: &PendingPublication,
+    request: &OperatorRequestSubject,
+) -> Result<LandingRecovery, String> {
+    let Some(_driving) = InFlight::try_enter(&pending.attempt_id) else {
+        return Ok(LandingRecovery::Busy);
+    };
+    if pending.merge_request_id.is_some()
+        || request.attempt_id != pending.job_id
+        || request.project_id != pending.project_id
+    {
+        return Ok(LandingRecovery::Undetermined(
+            "the publication's subject does not match the row that journaled it".to_string(),
+        ));
+    }
+    let journal = MergeAttemptJournal {
+        attempt_id: &pending.attempt_id,
+        project_id: &pending.project_id,
+        merge_request_id: None,
+        job_id: &pending.job_id,
+        target_ref: &pending.target_ref,
+        source_ref: &pending.source_ref,
+        policy_json: &pending.policy_json,
+    };
+    let settle = |state: &'static str, detail: serde_json::Value| async move {
+        journal_merge_attempt_event(
+            db,
+            &journal,
+            pending.next_sequence,
+            state,
+            &JournalEntry {
+                detail: Some(detail.to_string()),
+                ..JournalEntry::default()
+            },
+        )
+        .await
+    };
+    let repo_path = db
+        .query_opt_text(
+            "SELECT repo_path FROM projects WHERE id = ?1",
+            params![pending.project_id.as_str()],
+        )
+        .await
+        .map_err(|error| format!("the project is unreadable: {error}"))?
+        .ok_or_else(|| format!("project {} is gone", pending.project_id))?;
+    let publication = &pending.publication;
+    let evidence = if pending.local {
+        local_publication_evidence(orch, &repo_path, publication).await
+    } else {
+        remote_publication_evidence(orch, &repo_path, publication).await
+    };
+    match evidence {
+        LandingEvidence::Landed { commit, .. } => {
+            settle(
+                "succeeded",
+                serde_json::json!({"reconciled": true, "landedCommit": commit}),
+            )
+            .await?;
+            release_landing_pin(orch, &repo_path, &pending.attempt_id);
+            Ok(LandingRecovery::Recorded(commit))
+        }
+        LandingEvidence::DefinitelyNotLanded(reason) => {
+            settle(
+                "failed",
+                serde_json::json!({"reconciled": true, "reason": reason}),
+            )
+            .await?;
+            release_landing_pin(orch, &repo_path, &pending.attempt_id);
+            Ok(LandingRecovery::NotLanded(reason))
+        }
+        LandingEvidence::Unknown(reason) => Ok(LandingRecovery::Undetermined(reason)),
+    }
+}
+
 /// Finish an accepted origin landing whose MR was recorded before its local
 /// bookmarks. Only unchanged prepared coordinates move; newer source work and
 /// target descendants keep their own heads. Explicit reopen owns its coordinates.
@@ -1054,7 +1197,8 @@ async fn recover_recorded_bookmarks(
     if pending.local {
         return Ok(());
     }
-    let store = super::default_landing::store_of(orch, context);
+    let subject = super::context::LandingSubject::from(context);
+    let store = super::default_landing::store_of(orch, &subject);
     if !crate::jj::is_jj_dir(&store.path) {
         return Ok(());
     }
@@ -1096,7 +1240,7 @@ async fn recover_recorded_bookmarks(
         )
         .await
         .map_err(|()| "store busy while recording accepted landing".to_string())?;
-    super::default_landing::admit_landing_writers(orch, &guard, &reservation, context).await?;
+    super::default_landing::admit_landing_writers(orch, &guard, &reservation, &subject).await?;
     guard.blocking_phase("recover accepted landing bookmarks", || {
         let mut moves = Vec::new();
         for (branch, before, after) in [
@@ -1356,7 +1500,12 @@ async fn reconcile(
 ) -> Result<Vec<LandingRecovery>, String> {
     let mut outcomes = Vec::new();
     for pending in pending_publications(db, mr_id).await? {
-        let outcome = settle_publication(orch, db, &pending).await;
+        // Which arm settles a publication is what its intent says it is, never
+        // what a job or merge-request lookup fails to find.
+        let outcome = match &pending.request {
+            Some(request) => settle_request_publication(orch, db, &pending, request).await,
+            None => settle_publication(orch, db, &pending).await,
+        };
         match &outcome {
             Ok(outcome) => log::info!(
                 "landing recovery: publication {} of {}: {outcome:?}",
@@ -1758,7 +1907,7 @@ mod tests {
             let attempt = MergeAttemptJournal {
                 attempt_id,
                 project_id: "proj-gh",
-                merge_request_id: "mr-gh",
+                merge_request_id: Some("mr-gh"),
                 job_id: self.job,
                 target_ref: "refs/heads/main",
                 source_ref: "refs/heads/feature",
@@ -1806,7 +1955,7 @@ mod tests {
         let attempt = MergeAttemptJournal {
             attempt_id: "attempt-1",
             project_id: "proj-gh",
-            merge_request_id: "mr-gh",
+            merge_request_id: Some("mr-gh"),
             job_id: fx.job,
             target_ref: "refs/heads/main",
             source_ref: "refs/heads/feature",
@@ -2162,7 +2311,7 @@ mod tests {
         let attempt = MergeAttemptJournal {
             attempt_id: "attempt-1",
             project_id: "proj-gh",
-            merge_request_id: "mr-gh",
+            merge_request_id: Some("mr-gh"),
             job_id: fx.job,
             target_ref: "main",
             source_ref: "feature",
@@ -2571,6 +2720,7 @@ mod tests {
             publication: publication(),
             local: None,
             issue_generation: None,
+            subject: None,
         })
         .unwrap();
         let legacy = value["publication"].as_object_mut().unwrap();

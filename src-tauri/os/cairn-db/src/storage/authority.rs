@@ -445,11 +445,33 @@ pub async fn append_event(db: &LocalDb, event: NewAuthorizationEvent) -> DbResul
 
 /// Only the request acceptance transaction may call this writer. It constructs
 /// the journal record itself: callers cannot substitute scope, provenance or grant.
+/// The journal reason of an acceptance an operator decided.
+pub const REQUEST_ACCEPTANCE_REASON: &str = "operator_request_acceptance";
+/// The journal reason of an acceptance the request primitive derived from a
+/// parent acceptance's verified report (`RequestAcceptance::chained_from`).
+pub const CHAINED_ACCEPTANCE_REASON: &str = "operator_request_chained_acceptance";
+
+/// The reason an acceptance's journal event records: chained or operator.
+pub(super) fn acceptance_reason(
+    acceptance: &cairn_common::requests::RequestAcceptance,
+) -> &'static str {
+    if acceptance.chained_from.is_some() {
+        CHAINED_ACCEPTANCE_REASON
+    } else {
+        REQUEST_ACCEPTANCE_REASON
+    }
+}
+
 pub(super) async fn append_request_acceptance_conn(
     conn: &super::TrackedConnection,
     acceptance: &cairn_common::requests::RequestAcceptance,
 ) -> DbResult<String> {
     use cairn_common::authorization::{AuthorityAction, AuthorityPlace};
+    let summary = if acceptance.chained_from.is_some() {
+        format!("chain a {} operator request", acceptance.kind.as_str())
+    } else {
+        format!("accept {} operator request", acceptance.kind.as_str())
+    };
     let event = NewAuthorizationEvent {
         scope: AuthorityScope::new(
             AuthorityPlace::Resource {
@@ -458,9 +480,9 @@ pub(super) async fn append_request_acceptance_conn(
             AuthorityAction::Run,
         ),
         mutation: "update".into(),
-        summary: format!("accept {} operator request", acceptance.kind.as_str()),
+        summary,
         outcome: "request_accepted".into(),
-        reason: "operator_request_acceptance".into(),
+        reason: acceptance_reason(acceptance).into(),
         principal: AuthorityPrincipal {
             actor: Some(acceptance.operator.clone()),
             ..Default::default()

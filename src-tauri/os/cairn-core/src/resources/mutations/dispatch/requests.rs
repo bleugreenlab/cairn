@@ -130,7 +130,7 @@ mod tests {
             assert!(file_input(&input).is_err(), "{key}");
         }
         let error = file_input(&json!({"kind":"unknown","rationale":"test"})).unwrap_err();
-        for kind in ["rebuild", "bump_version", "lift_drain"] {
+        for kind in ["rebuild", "lift_drain", "fenced_command"] {
             assert!(error.contains(kind), "{error}");
         }
     }

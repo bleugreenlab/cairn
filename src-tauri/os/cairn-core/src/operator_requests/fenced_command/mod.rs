@@ -13,12 +13,13 @@
 
 use cairn_common::executor_protocol::{
     EdgeDisposition, EdgeId, EdgeRequirement, ExecutorHealthStatus, ExecutorInspection,
-    MaximumDisposition, NodeScratchGrant, ProcessClass, WorkloadEnvelope,
+    MaximumDisposition, MutationPolicy, NodeScratchGrant, ProcessClass, WorkloadEnvelope,
 };
 use cairn_common::protocol::CallbackRequest;
 use cairn_common::requests::{
-    ExecutorFloorWitness, FencedCommandAcceptance, FencedCommandAct, FencedCommandCommitFacts,
-    FencedCommandExecutorFacts, FencedCommandFacts, FencedCommandScratchFacts, FencedCommandTarget,
+    DeclaredCommandTarget, ExecutorFloorWitness, FencedCommandAcceptance, FencedCommandAct,
+    FencedCommandCommitFacts, FencedCommandExecutorFacts, FencedCommandFacts,
+    FencedCommandScratchFacts, FencedCommandTarget,
 };
 use cairn_common::run_contract::RUN_BATCH_CEILING_MS;
 use serde_json::Value;
@@ -27,6 +28,7 @@ use super::registry::ActorFacts;
 use crate::orchestrator::Orchestrator;
 
 pub(crate) mod consumer;
+pub(crate) mod declared;
 pub(crate) mod offer;
 pub(crate) use offer::offer_for;
 
@@ -43,6 +45,12 @@ pub(crate) struct OperatorAct {
     cell_request_id: String,
     cell_attempt_id: String,
     node_scratch: Option<NodeScratchGrant>,
+    /// The commit the cell checks out: the frozen commit, or for a declared
+    /// `lands` act the default branch's tip at the run.
+    base_commit: String,
+    /// `AllowDelta` only for a declared `lands` act, whose tracked changes come
+    /// back to be sealed; every other act's are discarded with the cell.
+    mutation_policy: MutationPolicy,
 }
 
 impl OperatorAct {
@@ -64,6 +72,14 @@ impl OperatorAct {
 
     pub(crate) fn node_scratch(&self) -> Option<&NodeScratchGrant> {
         self.node_scratch.as_ref()
+    }
+
+    pub(crate) fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    pub(crate) fn mutation_policy(&self) -> MutationPolicy {
+        self.mutation_policy.clone()
     }
 }
 
@@ -207,11 +223,35 @@ pub(crate) fn normalize_cwd(cwd: Option<&str>) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
+/// What a filing asks for: one exact command, or a project-declared one by
+/// name. The two shapes never combine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilingTarget {
+    Raw(FencedCommandTarget),
+    Declared(DeclaredCommandTarget),
+}
+
 /// Parse and validate what the agent asked for. Pure: no registry or branch
 /// state is consulted here.
-pub(crate) fn parse_target(raw: Option<&Value>) -> Result<FencedCommandTarget, String> {
-    let shape = "fenced_command requires target {executor, command, cwd?, timeoutMs?}";
+pub(crate) fn parse_target(raw: Option<&Value>) -> Result<FilingTarget, String> {
+    let shape = "fenced_command requires target {executor, command, cwd?, timeoutMs?} or {declared, params, executor?}";
     let raw = raw.ok_or(shape)?;
+    if raw.get("declared").is_some() {
+        let declared = "a declared fenced_command target is {declared, params, executor?}";
+        let target: DeclaredCommandTarget =
+            serde_json::from_value(raw.clone()).map_err(|error| format!("{declared}: {error}"))?;
+        if target.declared.trim().is_empty() {
+            return Err("fenced_command `declared` names no approved command".into());
+        }
+        if target
+            .executor
+            .as_deref()
+            .is_some_and(|executor| executor.trim().is_empty())
+        {
+            return Err("fenced_command `executor` is blank; omit it to let Cairn choose".into());
+        }
+        return Ok(FilingTarget::Declared(target));
+    }
     let target: FencedCommandTarget =
         serde_json::from_value(raw.clone()).map_err(|error| format!("{shape}: {error}"))?;
     if target.command.trim().is_empty() {
@@ -234,18 +274,23 @@ pub(crate) fn parse_target(raw: Option<&Value>) -> Result<FencedCommandTarget, S
         }
         _ => {}
     }
-    Ok(target)
+    Ok(FilingTarget::Raw(target))
 }
 
-/// Freeze the act a filing names: the run's own branch head, the executor's
-/// registry identity, and a cwd inside the checkout. Refuses before anything is
-/// persisted when the executor's floor is not measured refused.
+/// Freeze the act a filing names: for a raw command, the run's own branch
+/// head, the executor's registry identity, and a cwd inside the checkout; for a
+/// declared one, what [`declared::freeze`] reads at the default branch's tip.
+/// Refuses before anything is persisted when the executor's floor is not
+/// measured refused.
 pub(crate) async fn freeze(
     orch: &Orchestrator,
     request: &CallbackRequest,
     raw: Option<&Value>,
 ) -> Result<FencedCommandAct, String> {
-    let target = parse_target(raw)?;
+    let target = match parse_target(raw)? {
+        FilingTarget::Declared(target) => return declared::freeze(orch, request, target).await,
+        FilingTarget::Raw(target) => target,
+    };
     let cwd = normalize_cwd(target.cwd.as_deref())?;
     let executor_id = crate::fleet::management::resolve_executor_reference(orch, &target.executor)?;
     let floor = executor_floor(orch, &executor_id)?;
@@ -261,6 +306,7 @@ pub(crate) async fn freeze(
         command: target.command,
         timeout_ms: target.timeout_ms.unwrap_or(u64::from(RUN_BATCH_CEILING_MS)),
         node: agent.home,
+        declaration: None,
     })
 }
 
@@ -287,12 +333,18 @@ pub(crate) fn coalescing_key(encoded: &str) -> String {
     format!("{KIND}:{:x}", sha2::Sha256::digest(encoded.as_bytes()))
 }
 
-/// The requesting node's open scratch, if it has one. Never creates one.
+/// The requesting node's open scratch, if it has one and the act carries it.
+/// Never creates one. A declared act runs the default branch's own scripts,
+/// not the filer's files, so it carries no scratch and runs with a private
+/// `$TMPDIR`.
 pub(crate) async fn node_scratch_now(
     orch: &Orchestrator,
-    node: &str,
+    act: &FencedCommandAct,
 ) -> Result<Option<crate::node_scratch::NodeScratch>, String> {
-    crate::node_scratch::owner::open_by_uri(&orch.db.local, node)
+    if act.declaration.is_some() {
+        return Ok(None);
+    }
+    crate::node_scratch::owner::open_by_uri(&orch.db.local, &act.node)
         .await
         .map_err(|error| format!("the requesting node's $TMPDIR is unreadable: {error}"))
 }
@@ -307,10 +359,14 @@ pub(crate) async fn facts(orch: &Orchestrator, target: Option<&str>) -> Result<A
             floor.name
         ));
     }
-    let scratch = node_scratch_now(orch, &act.node).await?;
+    let scratch = node_scratch_now(orch, &act).await?;
     let scratch_head = scratch
         .as_ref()
         .and_then(|scratch| scratch.head_commit.clone());
+    let consequence = match &act.declaration {
+        Some(declared) => declared::card_consequence(&act, declared, &floor.name),
+        None => consequence(&floor.name),
+    };
     let document = FencedCommandFacts {
         scratch: scratch.as_ref().map(|scratch| FencedCommandScratchFacts {
             head: scratch.head_commit.clone(),
@@ -332,7 +388,8 @@ pub(crate) async fn facts(orch: &Orchestrator, target: Option<&str>) -> Result<A
         command: act.command.clone(),
         timeout_ms: act.timeout_ms,
         node: act.node.clone(),
-        consequence: consequence(&floor.name),
+        consequence,
+        declaration: act.declaration.clone(),
     };
     Ok(ActorFacts {
         document: serde_json::to_value(document)
@@ -386,7 +443,7 @@ pub(crate) async fn recheck_live(
     accepted: &FencedCommandAcceptance,
 ) -> Result<ExecutorFloor, String> {
     let floor = executor_floor(orch, &accepted.act.executor_id)?;
-    let scratch = node_scratch_now(orch, &accepted.act.node).await?;
+    let scratch = node_scratch_now(orch, &accepted.act).await?;
     check_live(
         accepted,
         &floor,
@@ -508,7 +565,13 @@ mod tests {
     #[test]
     fn the_target_is_typed_bounded_and_never_carries_a_commit() {
         let ok = parse_target(Some(&json!({"executor":"local","command":"ls"}))).unwrap();
-        assert_eq!(ok.timeout_ms, None);
+        assert!(matches!(
+            ok,
+            FilingTarget::Raw(FencedCommandTarget {
+                timeout_ms: None,
+                ..
+            })
+        ));
         for forged in ["commit", "executorId", "deviceId", "node", "branch"] {
             let mut raw = json!({"executor":"local","command":"ls"});
             raw[forged] = json!("forged");
@@ -530,6 +593,29 @@ mod tests {
         assert!(parse_target(Some(&json!({"executor":"local","command":long}))).is_err());
     }
 
+    /// A declared filing names the command and its params, never the text,
+    /// commit or branch, and never mixes with the raw shape.
+    #[test]
+    fn a_declared_target_names_the_command_and_never_its_text() {
+        let declared =
+            parse_target(Some(&json!({"declared":"bump","params":{"version":"sm"}}))).unwrap();
+        assert_eq!(
+            declared,
+            FilingTarget::Declared(DeclaredCommandTarget {
+                declared: "bump".into(),
+                params: [("version".to_string(), "sm".to_string())].into(),
+                executor: None,
+            })
+        );
+        for forged in ["command", "commit", "branch", "cwd", "timeoutMs"] {
+            let mut raw = json!({"declared":"bump","params":{"version":"sm"}});
+            raw[forged] = json!("forged");
+            assert!(parse_target(Some(&raw)).is_err(), "{forged}");
+        }
+        assert!(parse_target(Some(&json!({"declared":" "}))).is_err());
+        assert!(parse_target(Some(&json!({"declared":"bump","executor":""}))).is_err());
+    }
+
     fn act(command: &str, node: &str) -> FencedCommandAct {
         FencedCommandAct {
             executor_id: "exec-1".into(),
@@ -541,6 +627,7 @@ mod tests {
             command: command.into(),
             timeout_ms: 1_000,
             node: node.into(),
+            declaration: None,
         }
     }
 

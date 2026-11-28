@@ -333,7 +333,9 @@ pub(crate) struct PreparedBranch {
     pub(crate) head_after: String,
     /// The jj/Git tree object id of `head_after`.
     pub(crate) tree: String,
-    pub(crate) relationship: BaseRelationship,
+    /// How this coordinate came to be: carried by the canonical preparer
+    /// along a declared relationship, or taken exactly as it stands.
+    pub(crate) provenance: Provenance,
     pub(crate) base_commit: String,
     /// `base_commit` is an open session's recorded base, deliberately behind
     /// the live base: revalidation then compares only the branch, since a
@@ -353,6 +355,58 @@ pub(crate) struct PreparedBranch {
     /// [`Context::with_advance_pending`]): what was deferred, why, and how to
     /// run it now. `None` when nothing is owed.
     pub(crate) advance_pending: Option<String>,
+}
+
+/// How a [`PreparedBranch`] coordinate came to be.
+#[derive(Debug, Clone)]
+pub(crate) enum Provenance {
+    /// [`prepare_branch`] carried the branch onto its base along the declared
+    /// relationship its owner holds; revalidation reads that relationship again.
+    Prepared { relationship: BaseRelationship },
+    /// Taken exactly as it stands, never prepared: an operator request's
+    /// branch (`crate::jj::REQUEST_BRANCH_PREFIX`), whose head is the run's
+    /// base and which lands only onto `target` while `target` is at `tip`. It
+    /// has no owner and no relationship; revalidation compares `tip` and the
+    /// head alone.
+    Exact { target: String, tip: String },
+}
+
+impl PreparedBranch {
+    /// The declared relationship preparation carried the branch along, or
+    /// `None` for an exact coordinate, which was never prepared.
+    pub(crate) fn relationship(&self) -> Option<&BaseRelationship> {
+        match &self.provenance {
+            Provenance::Prepared { relationship } => Some(relationship),
+            Provenance::Exact { .. } => None,
+        }
+    }
+
+    /// The branch this coordinate is based on: the prepared base, or an exact
+    /// coordinate's target.
+    pub(crate) fn base_branch(&self) -> &str {
+        match &self.provenance {
+            Provenance::Prepared { relationship } => &relationship.base_branch,
+            Provenance::Exact { target, .. } => target,
+        }
+    }
+
+    /// The base as its owner declared it. An exact coordinate's target is the
+    /// one base it names.
+    pub(crate) fn declared_base(&self) -> Option<String> {
+        match &self.provenance {
+            Provenance::Prepared { relationship } => relationship.declared.clone(),
+            Provenance::Exact { target, .. } => Some(target.clone()),
+        }
+    }
+
+    /// The project default the coordinate was read against. An exact
+    /// coordinate only ever targets the project default.
+    pub(crate) fn project_default(&self) -> &str {
+        match &self.provenance {
+            Provenance::Prepared { relationship } => &relationship.project_default,
+            Provenance::Exact { target, .. } => target,
+        }
+    }
 }
 
 /// The recorded conflict a resolution commit proceeds under.
@@ -424,21 +478,27 @@ impl PreparedBranch {
                 self.store.display()
             )));
         }
+        let prepared = match &self.provenance {
+            Provenance::Prepared { relationship } => relationship,
+            Provenance::Exact { target, tip } => {
+                return self.revalidate_exact(target, tip, expected_head).await;
+            }
+        };
         let relationship = load_relationship(
             db,
             &self.project_id,
             &self.branch,
-            Some(&self.relationship.owner_job_id),
-            self.relationship.target_override.as_deref(),
+            Some(&prepared.owner_job_id),
+            prepared.target_override.as_deref(),
         )
         .await?;
-        if !relationship.same_base(&self.relationship) {
+        if !relationship.same_base(prepared) {
             return Err(PreparationRefusal::Moved {
-                what: relationship_change(&self.relationship, &relationship),
+                what: relationship_change(prepared, &relationship),
             });
         }
         let (head, base) =
-            literal_coordinates(&self.store, &self.branch, &self.relationship.base_branch).await?;
+            literal_coordinates(&self.store, &self.branch, &prepared.base_branch).await?;
         if head != expected_head {
             return Err(PreparationRefusal::Moved {
                 what: format!("`{}` moved from {expected_head} to {head}", self.branch),
@@ -446,18 +506,49 @@ impl PreparedBranch {
         }
         // A direct target is its own base: the writer's own publications
         // legitimately advance both, and the head check above covers it.
-        if !self.relationship.is_direct_target(&self.branch)
-            && !self.pinned_base
-            && base != self.base_commit
+        if !prepared.is_direct_target(&self.branch) && !self.pinned_base && base != self.base_commit
         {
             return Err(PreparationRefusal::Moved {
                 what: format!(
                     "base `{}` moved from {} to {base}",
-                    self.relationship.base_branch, self.base_commit
+                    prepared.base_branch, self.base_commit
                 ),
             });
         }
         self.revalidate_session(db).await
+    }
+
+    /// An exact coordinate holds while `target` is still at `tip` and the
+    /// branch is at `expected_head`, or, before the seal creates it, absent.
+    /// No relationship or owner is read: the coordinate never had one.
+    async fn revalidate_exact(
+        &self,
+        target: &str,
+        tip: &str,
+        expected_head: &str,
+    ) -> Result<(), PreparationRefusal> {
+        let (store, branch, target_name) =
+            (self.store.clone(), self.branch.clone(), target.to_string());
+        let (head, target_now) = tokio::task::spawn_blocking(move || {
+            let head = crate::jj::read_local_branch_state(&store, &branch)?.bookmark;
+            let target_now = crate::jj::read_local_branch_state(&store, &target_name)?.bookmark;
+            Ok::<_, String>((head, target_now))
+        })
+        .await
+        .map_err(|error| PreparationRefusal::Repository(format!("read the coordinate: {error}")))?
+        .map_err(PreparationRefusal::Repository)?;
+        if target_now.as_deref() != Some(tip) {
+            return Err(PreparationRefusal::Moved {
+                what: format!("`{target}` moved from {tip} to {target_now:?}"),
+            });
+        }
+        let unsealed = expected_head == self.head_after && head.is_none();
+        if !unsealed && head.as_deref() != Some(expected_head) {
+            return Err(PreparationRefusal::Moved {
+                what: format!("`{}` is at {head:?}, not {expected_head}", self.branch),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -522,6 +613,12 @@ pub(crate) struct BaseConflict {
 pub(crate) enum PreparationRefusal {
     /// No live job manages this branch (or the named owner is not on it).
     Unmanaged {
+        branch: String,
+    },
+    /// An operator request's branch (`crate::jj::REQUEST_BRANCH_PREFIX`): its
+    /// one commit lands exactly on the tip it was sealed on, or is discarded
+    /// and sealed again, so nothing ever carries it onto a newer base.
+    RequestBranch {
         branch: String,
     },
     /// A coordinate or relationship that cannot be read.
@@ -617,6 +714,7 @@ impl PreparationRefusal {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Unmanaged { .. } => "unmanaged",
+            Self::RequestBranch { .. } => "request branch",
             Self::Unresolved { .. } => "unresolved",
             Self::Absent { .. } => "absent",
             Self::RelationshipAmbiguous { .. } => "relationship ambiguous",
@@ -646,6 +744,10 @@ impl std::fmt::Display for PreparationRefusal {
             Self::Unmanaged { branch } => write!(
                 f,
                 "`{branch}` is not a managed branch with a live owner, so it was not prepared"
+            ),
+            Self::RequestBranch { branch } => write!(
+                f,
+                "`{branch}` is a request branch, and request branches are never advanced"
             ),
             Self::Unresolved { coordinate, reason } => {
                 write!(f, "`{coordinate}` could not be resolved: {reason}")
@@ -901,7 +1003,15 @@ pub(crate) async fn prepare_branch(
     let branch = request.branch.clone();
     let caller_reserved = request.reservation.is_some();
     let started = std::time::Instant::now();
-    let mut result = prepare_branch_unobserved(orch, request).await;
+    // Before the relationship is read: the owner check would otherwise answer
+    // first, and a request branch has no owner to find.
+    let mut result = if crate::jj::is_request_branch(&branch) {
+        Err(PreparationRefusal::RequestBranch {
+            branch: branch.clone(),
+        })
+    } else {
+        prepare_branch_unobserved(orch, request).await
+    };
     let note = match &result {
         Ok(prepared) => PreparationNote::Prepared {
             head_before: &prepared.head_before,
@@ -915,11 +1025,14 @@ pub(crate) async fn prepare_branch(
     };
     note_preparation(&branch, started.elapsed(), note);
     if let Ok(prepared) = result.as_mut() {
-        if prepared.advanced && !caller_reserved {
+        let carried_owner = prepared
+            .relationship()
+            .map(|relationship| relationship.owner_job_id.clone());
+        if let (true, false, Some(owner)) = (prepared.advanced, caller_reserved, carried_owner) {
             if let Err(error) = super::publish_carried_branch(
                 orch,
                 &prepared.project_id,
-                &prepared.relationship.owner_job_id,
+                &owner,
                 &prepared.store,
                 &prepared.branch,
             )
@@ -2491,7 +2604,7 @@ impl Context<'_> {
                 pinned_base: self.is_pinned(&coordinate.base),
                 head_after: coordinate.head,
                 tree,
-                relationship,
+                provenance: Provenance::Prepared { relationship },
                 base_commit: coordinate.base,
                 advanced: false,
                 export: recovered_export,
@@ -2554,7 +2667,7 @@ impl Context<'_> {
                         pinned_base: self.is_pinned(&coordinate.base),
                         head_after: coordinate.head,
                         tree,
-                        relationship,
+                        provenance: Provenance::Prepared { relationship },
                         base_commit: coordinate.base,
                         advanced: false,
                         export: recovered_export,
@@ -3019,7 +3132,7 @@ impl Context<'_> {
                 pinned_base: self.is_pinned(&coordinate.base),
                 head_after: coordinate.head,
                 tree,
-                relationship,
+                provenance: Provenance::Prepared { relationship },
                 base_commit: coordinate.base,
                 advanced: false,
                 export: recovered_export,
@@ -3235,7 +3348,7 @@ impl Context<'_> {
             head_before: installed.coordinate.head.clone(),
             head_after: installed.head.clone(),
             tree: installed.tree.clone(),
-            relationship,
+            provenance: Provenance::Prepared { relationship },
             pinned_base: self.is_pinned(&installed.coordinate.base),
             base_commit: installed.coordinate.base.clone(),
             advanced: true,
@@ -3533,7 +3646,7 @@ impl Context<'_> {
             head_before: head.clone(),
             head_after: head.clone(),
             tree,
-            relationship,
+            provenance: Provenance::Prepared { relationship },
             base_commit: head,
             pinned_base: false,
             advanced: false,
@@ -3862,7 +3975,9 @@ impl Context<'_> {
             head_before: coordinate.head.clone(),
             head_after: coordinate.head.clone(),
             tree,
-            relationship: relationship.clone(),
+            provenance: Provenance::Prepared {
+                relationship: relationship.clone(),
+            },
             base_commit: coordinate.base.clone(),
             pinned_base: self.is_pinned(&coordinate.base),
             advanced: false,

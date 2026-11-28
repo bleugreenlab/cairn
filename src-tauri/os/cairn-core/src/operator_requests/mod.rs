@@ -5,6 +5,7 @@
 //! components alone hold checked attempt references. Production adapters are
 //! intentionally absent until their physical enforcement is implemented.
 
+pub(crate) mod chain;
 pub(crate) mod delivery;
 pub(crate) mod fenced_command;
 pub mod registry;
@@ -28,7 +29,7 @@ use crate::orchestrator::Orchestrator;
 use crate::security::Sanitizer;
 use crate::storage::RowExt;
 use crate::threads::headlines;
-use registry::{ActorFacts, ConsumerReport, ReleaseVersion, RequestConsumer};
+use registry::{ActorFacts, ConsumerReport, RequestConsumer};
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -68,20 +69,7 @@ async fn decorate(orch: &Orchestrator, mut request: OperatorRequest) -> Operator
             } else {
                 None
             };
-            if refresh_error.is_some() {
-                refresh_error
-            } else if request.kind == RequestKind::BumpVersion
-                && request.state == RequestState::Open
-            {
-                let project = request
-                    .facts
-                    .as_ref()
-                    .and_then(|facts| facts.document.get("policyProjectId"))
-                    .and_then(Value::as_str);
-                bump_policy(orch, project).await.err()
-            } else {
-                None
-            }
+            refresh_error
         }
     };
     request.unavailable_reason = request.unavailable_reason.map(scrub_text);
@@ -332,20 +320,6 @@ fn required_text<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, S
         .ok_or_else(|| format!("Actor facts are unavailable: missing {name}"))
 }
 
-async fn bump_policy(orch: &Orchestrator, project_id: Option<&str>) -> Result<(), String> {
-    let project_id = project_id.filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| "bump_version is unavailable: the canonical target project's human_base_merge_policy cannot be identified".to_string())?;
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, project_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let policy =
-        crate::projects::human_base_merge_policy::read_policy(&db, None, project_id).await?;
-    if policy.state != "disabled" {
-        return Err(format!("bump_version refuses human_base_merge_policy={}: desktop acceptance cannot supply provably-human base-merge approval. Use the project's approved human landing path, or wait for a stronger approval adapter; this request cannot bypass that policy.", policy.state));
-    }
-    Ok(())
-}
-
 async fn identical_open_filing(
     orch: &Orchestrator,
     kind: RequestKind,
@@ -439,10 +413,7 @@ pub async fn file(
     explicit_requirements.commits.dedup();
     let filing = json!({"target":target_text,"requirements":explicit_requirements});
     let rationale = scrub_text(input.rationale);
-    if input.kind == RequestKind::BumpVersion {
-        bump_policy(orch, facts.policy_project_id.as_deref()).await?;
-    }
-    if matches!(input.kind, RequestKind::Rebuild | RequestKind::BumpVersion) {
+    if input.kind == RequestKind::Rebuild {
         if let Some(id) = identical_open_filing(
             orch,
             input.kind,
@@ -496,25 +467,6 @@ pub async fn file(
                 format!("rebuild:{install}"),
                 None,
                 json!({"commits":requirements.commits}),
-            )
-        }
-        RequestKind::BumpVersion => {
-            if !requirements.commits.is_empty() {
-                return Err("requirements.commits is supported only for rebuild".into());
-            }
-            bump_policy(orch, facts.policy_project_id.as_deref()).await?;
-            let requested = target_text
-                .as_deref()
-                .ok_or("bump_version requires sm, md, lg or plain X.Y.Z")?;
-            let running =
-                ReleaseVersion::parse(required_text(&facts.running_version, "running version")?)?;
-            let minimum = running.resolve(requested)?.to_string();
-            (
-                Some(minimum.clone()),
-                install.clone(),
-                format!("bump_version:{install}"),
-                Some(minimum.clone()),
-                json!({"requestedTarget":requested,"minimumVersion":minimum,"runningVersion":running.to_string(),"policyProjectId":facts.policy_project_id}),
             )
         }
         RequestKind::LiftDrain => {
@@ -769,6 +721,7 @@ pub async fn accept(
         policy_project_id: facts.policy_project_id.clone(),
         drain: facts.drain.clone(),
         fenced_command: facts.fenced_command.clone(),
+        chained_from: None,
         operator: principal.clone(),
         appearance: appearance.clone(),
         accepted_at: now(),
@@ -804,23 +757,6 @@ async fn check_snapshot(
                 .flat_map(|entry| entry.requirements.commits.iter().cloned())
                 .collect::<Vec<_>>();
             adapter.contains_commits(orch, commit, &commits).await?;
-        }
-        RequestKind::BumpVersion => {
-            bump_policy(orch, acceptance.policy_project_id.as_deref()).await?;
-            let current = adapter
-                .facts(orch, Some(&request.id), request.target.as_deref())
-                .await?;
-            let running =
-                ReleaseVersion::parse(required_text(&current.running_version, "running version")?)?;
-            let effective =
-                ReleaseVersion::parse(required_text(&request.target, "effective target")?)?;
-            if effective <= running {
-                return Err(format!("bump_version target {effective} is stale against running {running}; refresh facts and explicitly refresh the request. No implicit extra bump is authorized."));
-            }
-            let base = required_text(&facts.base_commit, "displayed base commit")?;
-            if !commit_id(base) {
-                return Err("Displayed bump base is not a full commit id".into());
-            }
         }
         RequestKind::LiftDrain => {
             if acceptance.drain.is_none() {
@@ -994,9 +930,6 @@ impl AcceptedRequestContext {
         )
         .await
         .map_err(|error| error.to_string())?;
-        if self.acceptance.kind == RequestKind::BumpVersion {
-            bump_policy(orch, self.acceptance.policy_project_id.as_deref()).await?;
-        }
         self.adapter.availability(orch).await?;
         self.adapter.validate_snapshot(orch, &self.acceptance).await
     }
@@ -1015,81 +948,20 @@ impl AcceptedRequestContext {
         verified.document = scrub_document(
             json!({"evidence":verified.document,"builtCommit":verified.built_commit}),
         );
-        let prior_coverage = store::report_receipt_coverage(
-            &orch.db.local,
-            &self.acceptance.attempt_id,
-            &self.claim_id,
-            receipt_id,
-            &verified.outcome,
-            &verified.document,
-            verified.settled,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let replay = prior_coverage.is_some();
-        let mut covered = prior_coverage.unwrap_or_default();
-        if !replay && verified.outcome == RequestAttemptOutcome::Done {
+        if verified.outcome == RequestAttemptOutcome::Done {
             if !verified.settled {
                 return Err("Success requires positive actor settlement".into());
             }
-            match self.acceptance.kind {
-                RequestKind::Rebuild => {
-                    if verified.built_commit.as_ref() != self.acceptance.candidate_commit.as_ref() {
-                        return Err("Successful rebuild evidence does not match the accepted candidate commit".into());
-                    }
-                }
-                RequestKind::BumpVersion => {
-                    let built =
-                        required_text(&verified.built_commit, "verified built bump commit")?;
-                    if !commit_id(built) {
-                        return Err("Verified bump commit must be a full commit id".into());
-                    }
-                    let mut offset = 0;
-                    loop {
-                        let requests = store::list_requests(
-                            &orch.db.local,
-                            &self.acceptance.workspace_id,
-                            &RequestFilter {
-                                status: Some(RequestState::Open),
-                                kind: Some(RequestKind::Rebuild),
-                                limit: Some(200),
-                                offset: Some(offset),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                        let count = requests.len();
-                        for request in requests {
-                            for contribution in request.requesters.iter().filter(|entry| {
-                                entry.active && entry.satisfied_by_attempt.is_none()
-                            }) {
-                                if self
-                                    .adapter
-                                    .contains_commits(
-                                        orch,
-                                        built,
-                                        &contribution.requirements.commits,
-                                    )
-                                    .await
-                                    .is_ok()
-                                {
-                                    covered.push(contribution.id.clone());
-                                }
-                            }
-                        }
-                        if count < 200 {
-                            break;
-                        }
-                        offset += 200;
-                    }
-                }
-                RequestKind::LiftDrain | RequestKind::FencedCommand => {}
+            if self.acceptance.kind == RequestKind::Rebuild
+                && verified.built_commit.as_ref() != self.acceptance.candidate_commit.as_ref()
+            {
+                return Err(
+                    "Successful rebuild evidence does not match the accepted candidate commit"
+                        .into(),
+                );
             }
         }
-        covered.sort();
-        covered.dedup();
-        store::report_request_with_fulfillment(
+        store::report_request(
             &orch.db.local,
             &self.acceptance.attempt_id,
             &self.claim_id,
@@ -1097,7 +969,6 @@ impl AcceptedRequestContext {
             verified.outcome,
             verified.document,
             verified.settled,
-            &covered,
             now(),
         )
         .await
@@ -1134,9 +1005,6 @@ pub(crate) async fn dispatch_accepted(orch: &Orchestrator, event_id: &str) -> Re
     }
     let validation = async {
         let adapter = consumer(orch, expected.kind).await?;
-        if expected.kind == RequestKind::BumpVersion {
-            bump_policy(orch, expected.policy_project_id.as_deref()).await?;
-        }
         adapter.validate_snapshot(orch, &expected).await?;
         Ok::<_, String>(adapter)
     }

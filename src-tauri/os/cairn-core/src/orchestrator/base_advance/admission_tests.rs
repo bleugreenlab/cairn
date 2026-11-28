@@ -365,6 +365,7 @@ const NAMED_WRITERS: &[&str] = &[
     "squash_branch_onto(",
     "publish_logical_head_exported(",
     "retire_bookmark_expecting(",
+    "create_bookmark_expecting_absent(",
     "repair_conflicted_branch_name(",
     "repair_conflicted_bookmark_name(",
     "collapse_divergent_bookmark(",
@@ -442,6 +443,30 @@ const ADMITTED_ELSEWHERE: &[(&str, &str, &str)] = &[
         "retire_bookmark_expecting(",
         "the retirement admits the branch by permit under its guard and reservation before \
          handing both to the blocking worker",
+    ),
+    (
+        "mcp/handlers/run/mod.rs",
+        "create_bookmark_expecting_absent(",
+        "create_exact_branch runs only inside publish_available_delta, after it mints the \
+         request branch's write permit on its held guard and reservation",
+    ),
+    (
+        "mcp/handlers/run/mod.rs",
+        "retire_bookmark_expecting(",
+        "remove_created_exact_branch undoes create_exact_branch inside publish_available_delta, \
+         under the same guard, reservation and write permit",
+    ),
+    (
+        "pr_data/actions/default_landing.rs",
+        "retire_bookmark_expecting(",
+        "retire_request_branch's closure runs inside end_request_branch, after it reserves the \
+         request branch, takes the store lock and mints its write permit",
+    ),
+    (
+        "jj/request_branch.rs",
+        "retire_bookmark_expecting(",
+        "discard_unlanded_bookmark_expecting is called only by discard_request_branch through \
+         end_request_branch, which reserves the branch and mints its write permit first",
     ),
     (
         "orchestrator/base_advance/preparation.rs",

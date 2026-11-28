@@ -13,7 +13,7 @@
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
-use jj_lib::repo::ReadonlyRepo;
+use jj_lib::repo::{ReadonlyRepo, Repo as _};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,6 +90,15 @@ pub fn retire_bookmark_expecting(
             transaction
                 .repo_mut()
                 .set_local_bookmark_target(RefName::new(branch), RefTarget::absent());
+            // The git ref is deleted below, so the store's record of what it
+            // last exported there (`<branch>@git`) goes with the bookmark.
+            // Left behind, the next export of a branch created again under
+            // this name reads the absent ref as one moved outside the store
+            // and refuses to publish it.
+            transaction.repo_mut().set_remote_bookmark(
+                RefName::new(branch).to_remote_symbol(jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO),
+                jj_lib::op_store::RemoteRef::absent_ref().clone(),
+            );
             transaction
                 .commit(format!("retire branch {branch}"))
                 .await
@@ -103,6 +112,43 @@ pub fn retire_bookmark_expecting(
             }
         }
         Ok(Retirement::Retired)
+    })
+}
+
+/// Create `branch` at `commit` only while it has neither a bookmark nor a git
+/// ref: one jj-lib transaction that sets that one bookmark and touches nothing
+/// else. A name that exists in either copy is refused with nothing changed, so
+/// a creation can never take over a branch something else already wrote. The
+/// git ref follows at the branch's next export. The caller holds the branch
+/// reserved and the store lock.
+pub fn create_bookmark_expecting_absent(
+    store: &Path,
+    branch: &str,
+    commit: &str,
+) -> Result<(), String> {
+    let id = jj_lib::backend::CommitId::try_from_hex(commit)
+        .ok_or_else(|| format!("`{commit}` is not a full hexadecimal commit id"))?;
+    block_on(async {
+        let repo = settled_repo(store).await?;
+        let now = state_at(&repo, store, branch)?;
+        if now.bookmark.is_some() || now.git_ref.is_some() {
+            return Err(format!(
+                "`{branch}` already exists (bookmark {:?}, git ref {:?}), so it was not created",
+                now.bookmark, now.git_ref
+            ));
+        }
+        repo.store()
+            .get_commit(&id)
+            .map_err(|error| format!("`{branch}` cannot be created at {commit}: {error}"))?;
+        let mut transaction = repo.start_transaction();
+        transaction
+            .repo_mut()
+            .set_local_bookmark_target(RefName::new(branch), RefTarget::normal(id));
+        transaction
+            .commit(format!("create branch {branch}"))
+            .await
+            .map_err(|error| format!("create the bookmark `{branch}`: {error}"))?;
+        Ok(())
     })
 }
 

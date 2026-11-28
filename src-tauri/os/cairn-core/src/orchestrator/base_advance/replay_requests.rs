@@ -702,7 +702,7 @@ async fn replay_attempt(
             Ok(prepared) => {
                 let answer = landed(db, branch, session.is_some(), &prepared, merge_mode).await;
                 let how = Settle::Served {
-                    base_branch: prepared.relationship.base_branch.clone(),
+                    base_branch: prepared.base_branch().to_string(),
                     base_commit: prepared.base_commit.clone(),
                     record: Some(Verdict {
                         outcome: if prepared.advanced && merge_mode {
@@ -1907,7 +1907,7 @@ async fn increment_round(
     budget: &Budget,
 ) -> Option<String> {
     let branch = ask.branch;
-    let base_branch = &landed.relationship.base_branch;
+    let base_branch = landed.base_branch();
     let recorded = landed.base_commit.as_str();
     let live = match cairn_vcs::resolve_coordinate(store, base_branch).await {
         Ok(live) => live,
@@ -2014,7 +2014,7 @@ async fn landed(
     prepared: &PreparedBranch,
     merge_mode: bool,
 ) -> String {
-    let base = &prepared.relationship.base_branch;
+    let base = prepared.base_branch();
     let on_recorded = if prepared.pinned_base {
         " (your resolution landed on the base it was made against)"
     } else {

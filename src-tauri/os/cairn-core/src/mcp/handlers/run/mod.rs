@@ -1671,8 +1671,177 @@ async fn prepare_slot_publication(
         run_id: None,
         prior_since_ms: None,
     };
-    prepare_slot_branch(orch, target, request, delta, message, author, &mut prepared).await;
+    if crate::jj::is_request_branch(&target.branch) {
+        // Nothing to prepare: a request branch is sealed exactly on the run's
+        // base, and preparation refuses the namespace by name.
+        prepared.coordinate = exact_request_coordinate(orch, target, request).await;
+    } else {
+        prepare_slot_branch(orch, target, request, delta, message, author, &mut prepared).await;
+    }
     Ok(prepared)
+}
+
+/// Runs once, right after the next exact coordinate captures its target's tip,
+/// so a test can move the target inside the seal's preparation interval.
+#[cfg(test)]
+pub(crate) static AFTER_EXACT_CAPTURE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+/// The exact coordinate an operator request's branch is sealed at: head and
+/// base are both the run's base, and the target is the project's default
+/// branch at its current tip. The branch does not exist yet; the publication
+/// creates it, expecting it absent, under the store lock.
+async fn exact_request_coordinate(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &CellRequest,
+) -> Result<PublicationCoordinate, String> {
+    use crate::orchestrator::base_advance::preparation::{PreparedExport, Provenance};
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, &target.project_id)
+        .await
+        .map_err(|error| format!("the project's database is unavailable: {error}"))?;
+    let (repo_path, stored_default) = db
+        .query_opt(
+            "SELECT repo_path, default_branch FROM projects WHERE id = ?1",
+            cairn_db::turso::params![target.project_id.as_str()],
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .map_err(|error| format!("the project is unreadable: {error}"))?
+        .ok_or_else(|| format!("project {} is gone", target.project_id))?;
+    let default_branch = crate::config::project_settings::effective_default_branch(
+        Some(Path::new(&repo_path)),
+        stored_default.as_deref(),
+    );
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let tip = crate::jj::bookmark_commit(&jj, &target.store_dir, &default_branch)
+        .ok_or_else(|| format!("the store has no `{default_branch}` to seal a request onto"))?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_EXACT_CAPTURE.lock().unwrap().take() {
+        hook();
+    }
+    let base = request.base_commit.clone();
+    let tree = crate::jj::sealed_tree_hash_via_git(&jj, &target.store_dir, &base)?;
+    Ok(PublicationCoordinate {
+        prepared: PreparedBranch {
+            project_id: target.project_id.clone(),
+            store: target.store_dir.clone(),
+            branch: target.branch.clone(),
+            head_before: base.clone(),
+            head_after: base.clone(),
+            tree,
+            provenance: Provenance::Exact {
+                target: default_branch,
+                tip,
+            },
+            base_commit: base,
+            pinned_base: false,
+            advanced: false,
+            export: PreparedExport::NotNeeded,
+            attempts: 1,
+            session: None,
+            warnings: Vec::new(),
+            advance_pending: None,
+        },
+        db,
+    })
+}
+
+/// What [`seal_request_delta`] sealed: the one commit on the request branch,
+/// and the base that is its only parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SealedRequestCommit {
+    pub(crate) commit: String,
+    pub(crate) base: String,
+}
+
+/// Why [`seal_request_delta`] sealed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SealRefusal {
+    /// The target moved past the tip the seal captured, so the delta can no
+    /// longer be sealed exactly there. Running again on the new tip may.
+    BaseMoved(String),
+    /// Anything else. Running again would meet the same refusal.
+    Refused(String),
+}
+
+impl std::fmt::Display for SealRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BaseMoved(why) | Self::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Seal an accepted operator request's delta as exactly one commit on its own
+/// branch `branch` (`crate::jj::REQUEST_BRANCH_PREFIX`), authored by the
+/// managed identity, whose only parent is the run's base. The branch must not
+/// exist yet: it is created expecting it absent, under the store lock.
+///
+/// The delta must change something, and only paths `admits` accepts. Anything
+/// else is refused; a branch or target that moved before the seal is
+/// [`SealRefusal::BaseMoved`]. Either way nothing is kept: an exact seal is
+/// never held, stranded or integrated.
+pub(crate) async fn seal_request_delta(
+    orch: &Orchestrator,
+    store_dir: &Path,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    branch: &str,
+    message: &str,
+    admits: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> Result<SealedRequestCommit, SealRefusal> {
+    if !crate::jj::is_request_branch(branch) {
+        return Err(SealRefusal::Refused(format!(
+            "`{branch}` is not a request branch; a request delta is sealed only under `{}`",
+            crate::jj::REQUEST_BRANCH_PREFIX
+        )));
+    }
+    let repository = request.repository.colocated_path().ok_or_else(|| {
+        SealRefusal::Refused("a request seal requires a colocated repository".to_string())
+    })?;
+    let changed =
+        delta_paths_outside(Path::new(repository), delta, &|_| false).map_err(|error| {
+            SealRefusal::Refused(format!(
+                "the delta's changed paths could not be read: {error}"
+            ))
+        })?;
+    if changed.is_empty() {
+        return Err(SealRefusal::Refused(
+            "the command changed nothing, so there is nothing to seal".to_string(),
+        ));
+    }
+    let author = cairn_vcs::PublicationIdentity::new(
+        cairn_vcs::MANAGED_IDENTITY_NAME,
+        cairn_vcs::MANAGED_IDENTITY_EMAIL,
+    );
+    let published = publish_and_seal_slot_delta_within(
+        orch,
+        store_dir,
+        request,
+        delta,
+        branch,
+        message,
+        Some(&author),
+        Some(admits),
+    )
+    .await
+    .map_err(SealRefusal::Refused)?
+    .ok_or_else(|| {
+        SealRefusal::BaseMoved(format!(
+            "`{branch}` or its target moved before the seal; nothing was sealed"
+        ))
+    })?;
+    if !published.landed_on_tested_base || published.patch.is_empty() {
+        return Err(SealRefusal::Refused(format!(
+            "the seal of `{branch}` did not produce one commit on the run's base {}",
+            delta.base_commit
+        )));
+    }
+    Ok(SealedRequestCommit {
+        commit: published.commit,
+        base: delta.base_commit.clone(),
+    })
 }
 
 /// Prepare (again) the branch an installed delta lands on, and plan the delta
@@ -1961,6 +2130,26 @@ async fn prepared_barrier(
         };
         match coordinate.prepared.revalidate(&coordinate.db, &guard).await {
             Ok(()) => {}
+            // An exact coordinate is pinned to the tip it captured, and its
+            // namespace is never prepared, so preparing again cannot help:
+            // the delta is superseded, and its caller runs again on the new tip.
+            Err(PreparationRefusal::Moved { what })
+                if matches!(
+                    coordinate.prepared.provenance,
+                    crate::orchestrator::base_advance::preparation::Provenance::Exact { .. }
+                ) && own.as_ref().is_some_and(|own| own.fold == DeltaFold::Exact) =>
+            {
+                drop(guard);
+                drop(reservation);
+                log::info!(
+                    "{operation} on `{}`: {what} after its exact capture; superseded",
+                    key.branch
+                );
+                return PreparedBarrier {
+                    drained: Vec::new(),
+                    own: Some(Err(SlotPublicationError::Superseded)),
+                };
+            }
             Err(PreparationRefusal::Moved { what }) if attempt < PREPARATION_ATTEMPTS => {
                 drop(guard);
                 drop(reservation);
@@ -2590,11 +2779,10 @@ async fn publish_available_delta(
         "This commit",
     )
     .await?;
-    let crate::jj::PublishedLogicalHead {
-        landed,
-        export,
-        timings,
-    } = crate::jj::publish_logical_head_exported(
+    // An exact coordinate's branch is created here, at its head, only while
+    // it is absent; the transaction below then moves it from that head.
+    let created = create_exact_branch(coordinate, store_dir, branch, &head)?;
+    let published = crate::jj::publish_logical_head_exported(
         &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
         store_dir,
         branch,
@@ -2606,7 +2794,20 @@ async fn publish_available_delta(
         identity,
         mode,
     )
-    .await?;
+    .await;
+    let crate::jj::PublishedLogicalHead {
+        landed,
+        export,
+        timings,
+    } = match published {
+        Ok(published) => published,
+        Err(error) => {
+            if created {
+                remove_created_exact_branch(store_dir, branch, &head);
+            }
+            return Err(error.into());
+        }
+    };
     if let Some(trace) = trace {
         trace.record_publication(&timings);
     }
@@ -2626,6 +2827,45 @@ async fn publish_available_delta(
         }),
         published_onto: head,
     })
+}
+
+/// Create an exact coordinate's branch at `head` when it does not exist yet.
+/// `Ok(true)` when this call created it. A prepared coordinate's branch always
+/// exists, and is never created here. The caller holds the store lock.
+fn create_exact_branch(
+    coordinate: &PreparedBranch,
+    store_dir: &Path,
+    branch: &str,
+    head: &str,
+) -> Result<bool, PublishFailure> {
+    use crate::orchestrator::base_advance::preparation::Provenance;
+    if !matches!(coordinate.provenance, Provenance::Exact { .. }) {
+        return Ok(false);
+    }
+    let state = crate::jj::read_local_branch_state(store_dir, branch)?;
+    if state.bookmark.is_some() {
+        return Ok(false);
+    }
+    crate::jj::create_bookmark_expecting_absent(store_dir, branch, head)?;
+    Ok(true)
+}
+
+/// Undo [`create_exact_branch`] after the publication onto it failed, so a
+/// failed seal keeps nothing. Only the bookmark exactly as created is removed.
+fn remove_created_exact_branch(store_dir: &Path, branch: &str, head: &str) {
+    let removed = crate::jj::read_local_branch_state(store_dir, branch).and_then(|state| {
+        if state.bookmark.as_deref() != Some(head) {
+            return Ok(crate::jj::Retirement::Refused(format!(
+                "`{branch}` is no longer at {head}"
+            )));
+        }
+        crate::jj::retire_bookmark_expecting(store_dir, branch, &state)
+    });
+    match removed {
+        Ok(crate::jj::Retirement::Retired) => {}
+        Ok(other) => log::warn!("the unsealed `{branch}` was not removed: {other:?}"),
+        Err(error) => log::warn!("the unsealed `{branch}` was not removed: {error}"),
+    }
 }
 
 impl SlotPublicationOutcome {

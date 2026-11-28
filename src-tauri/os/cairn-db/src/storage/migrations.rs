@@ -2427,6 +2427,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "request_report_receipts",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    (
+        "request_chains",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     // cairn/5712: who may spend this install's models through the served API,
     // and the journal of what each such client spent. Same reasoning as the
     // grants: a teammate's install never issued these keys.

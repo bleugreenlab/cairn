@@ -1,6 +1,6 @@
 use super::*;
 use crate::orchestrator::base_advance::preparation::PreparedBranch;
-use crate::pr_data::actions::context::MrContext;
+use crate::pr_data::actions::context::{LandingSubject, MergeMrContext, MrContext};
 use crate::pr_data::actions::merge::MergeAttemptJournal;
 use crate::pr_data::actions::test_support::migrated_db;
 use crate::services::testing::{MockGitClient, TestServicesBuilder};
@@ -34,11 +34,16 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn init_git_project(repo: &Path) {
+fn init_git_project(repo: &Path, files: &[(&str, &str)]) {
     git(repo, &["init", "-q", "-b", "main"]);
     git(repo, &["config", "user.email", "p@e.com"]);
     git(repo, &["config", "user.name", "P"]);
     std::fs::write(repo.join("seed.rs"), "base\n").unwrap();
+    for (name, content) in files {
+        let path = repo.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "base"]);
 }
@@ -123,12 +128,30 @@ struct MergeFixture {
 }
 
 async fn setup_clean_merge(bin: &str) -> MergeFixture {
+    setup_clean_merge_with_git(bin, MockGitClient::new()).await
+}
+
+/// [`setup_clean_merge`] with `git` as the orchestrator's git client, for a
+/// landing whose follow-ups read or repair the project checkout.
+async fn setup_clean_merge_with_git(
+    bin: &str,
+    git_client: impl crate::services::GitClient + 'static,
+) -> MergeFixture {
+    setup_clean_merge_seeded(bin, git_client, &[]).await
+}
+
+/// [`setup_clean_merge_with_git`] whose base commit also holds `files`.
+async fn setup_clean_merge_seeded(
+    bin: &str,
+    git_client: impl crate::services::GitClient + 'static,
+    files: &[(&str, &str)],
+) -> MergeFixture {
     let home_root = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     let wts = tempfile::tempdir().unwrap();
     let origin = tempfile::tempdir().unwrap();
     git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    init_git_project(proj.path());
+    init_git_project(proj.path(), files);
     git(
         proj.path(),
         &["remote", "add", "origin", &origin.path().to_string_lossy()],
@@ -144,11 +167,7 @@ async fn setup_clean_merge(bin: &str) -> MergeFixture {
         use crate::db::DbState;
         let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
         let db_state = Arc::new(DbState::new(Arc::new(db), search));
-        let services = Arc::new(
-            TestServicesBuilder::new()
-                .with_git(MockGitClient::new())
-                .build(),
-        );
+        let services = Arc::new(TestServicesBuilder::new().with_git(git_client).build());
         Orchestrator::builder(db_state, services, config_dir.clone())
             .jj_binary_path(bin.to_string())
             .landing_preparation_budget(FIXTURE_PREPARATION_BUDGET)
@@ -278,7 +297,7 @@ async fn a_landing_without_an_override_prepares_under_the_production_budget() {
         has_triage_batch: false,
     };
 
-    let request = landing_preparation_request(&orch, "job-src", &ctx);
+    let request = landing_preparation_request(&orch, "job-src", &LandingSubject::from(&ctx));
     assert_eq!(request.compute_budget, DEFAULT_COMPUTE_BUDGET);
     assert_eq!(
         request.compute_budget,
@@ -384,7 +403,7 @@ async fn a_prepared_landing_stops_holding_when_its_source_or_target_moves() {
                     "landing recheck test",
                 )
                 .await;
-            prepared_landing_holds(orch, ctx, &prepared, &guard)
+            prepared_landing_holds(orch, &LandingSubject::from(ctx), &prepared, &guard)
                 .await
                 .unwrap()
         }
@@ -393,7 +412,7 @@ async fn a_prepared_landing_stops_holding_when_its_source_or_target_moves() {
     let prepared = prepare_landing_source(
         &fx.orch,
         "job-src",
-        &fx.ctx,
+        &LandingSubject::from(&fx.ctx),
         &reserve_landing_shared(&fx).await,
     )
     .await
@@ -409,7 +428,7 @@ async fn a_prepared_landing_stops_holding_when_its_source_or_target_moves() {
     let prepared = prepare_landing_source(
         &fx.orch,
         "job-src",
-        &fx.ctx,
+        &LandingSubject::from(&fx.ctx),
         &reserve_landing_shared(&fx).await,
     )
     .await
@@ -424,7 +443,7 @@ async fn a_prepared_landing_stops_holding_when_its_source_or_target_moves() {
     let again = prepare_landing_source(
         &fx.orch,
         "job-src",
-        &fx.ctx,
+        &LandingSubject::from(&fx.ctx),
         &reserve_landing_shared(&fx).await,
     )
     .await
@@ -453,7 +472,7 @@ async fn a_local_default_landing_lands_exactly_onto_the_prepared_target() {
     let journal = MergeAttemptJournal {
         attempt_id: "attempt",
         project_id: "proj-1",
-        merge_request_id: "mr",
+        merge_request_id: Some("mr"),
         job_id: "job-src",
         target_ref: "refs/heads/main",
         source_ref: "refs/heads/source",
@@ -461,7 +480,12 @@ async fn a_local_default_landing_lands_exactly_onto_the_prepared_target() {
     };
 
     let landed = crate::pr_data::actions::default_landing::land_on_default(
-        &fx.orch, "job-src", &ctx, "squash", None, &journal,
+        &fx.orch,
+        "job-src",
+        &LandingSubject::from(&ctx),
+        "squash",
+        None,
+        &journal,
     )
     .await
     .expect("a clean stale source lands");
@@ -557,7 +581,7 @@ async fn retarget(fx: &MergeFixture, target: &str) {
 const JOURNAL: MergeAttemptJournal<'static> = MergeAttemptJournal {
     attempt_id: "attempt",
     project_id: "proj-1",
-    merge_request_id: "mr",
+    merge_request_id: Some("mr"),
     job_id: "job-src",
     target_ref: "refs/heads/main",
     source_ref: "refs/heads/source",
@@ -643,7 +667,12 @@ async fn a_remote_landing_moves_the_store_only_after_origin_accepts_and_blocks_o
     };
 
     let landed = crate::pr_data::actions::default_landing::land_on_default(
-        &fx.orch, "job-src", &ctx, "squash", None, &JOURNAL,
+        &fx.orch,
+        "job-src",
+        &LandingSubject::from(&ctx),
+        "squash",
+        None,
+        &JOURNAL,
     )
     .await;
     publication_barrier::clear(&fx.store);
@@ -691,9 +720,15 @@ async fn measured_landing(
     let landed = merge_metrics::measured(Arc::clone(&attempt), async {
         merge_metrics::identify("mr", None, &ctx.source_branch, &ctx.target_branch);
         crate::pr_data::actions::default_landing::land_on_default(
-            &fx.orch, "job-src", ctx, "squash", None, &JOURNAL,
+            &fx.orch,
+            "job-src",
+            &LandingSubject::from(ctx),
+            "squash",
+            None,
+            &JOURNAL,
         )
         .await
+        .map_err(String::from)
     })
     .await;
     (attempt, landed)
@@ -869,7 +904,7 @@ async fn a_landing_without_a_recorded_origin_target_fetches_first() {
         (Some(main), false),
         "a fresh store's copy of origin's main is an untracked import"
     );
-    let store = store_of(&fx.orch, &ctx);
+    let store = store_of(&fx.orch, &LandingSubject::from(&ctx));
     assert_eq!(
         recorded_origin_target(&store, "main").await,
         None,
@@ -993,9 +1028,15 @@ async fn a_landing_onto_a_target_owing_an_unknown_acceptance_is_refused_before_a
     let owed = owe(&fx, "main", "unknown", &"1".repeat(40), &"2".repeat(40)).await;
 
     let refused = crate::pr_data::actions::default_landing::land_on_default(
-        &fx.orch, "job-src", &ctx, "squash", None, &JOURNAL,
+        &fx.orch,
+        "job-src",
+        &LandingSubject::from(&ctx),
+        "squash",
+        None,
+        &JOURNAL,
     )
     .await
+    .map_err(String::from)
     .expect_err("a target owing an unsettled acceptance takes no landing");
 
     assert!(
@@ -1036,9 +1077,14 @@ async fn detached_landing_keeps_live_coordinates_until_journaled_install() {
     let Some(bin) = jj_bin() else { return };
     let fx = setup_clean_merge(&bin).await;
     let reservation = reserve_landing_shared(&fx).await;
-    let prepared = prepare_landing_source(&fx.orch, "job-src", &fx.ctx, &reservation)
-        .await
-        .unwrap();
+    let prepared = prepare_landing_source(
+        &fx.orch,
+        "job-src",
+        &LandingSubject::from(&fx.ctx),
+        &reservation,
+    )
+    .await
+    .unwrap();
     let guard = fx
         .orch
         .acquire_jj_store_lock(
@@ -1047,7 +1093,7 @@ async fn detached_landing_keeps_live_coordinates_until_journaled_install() {
             "detached landing test",
         )
         .await;
-    let store = store_of(&fx.orch, &fx.ctx);
+    let store = store_of(&fx.orch, &LandingSubject::from(&fx.ctx));
     let before = cairn_vcs::read_local_bookmark_view(&fx.store).unwrap();
     let git_dir = crate::jj::store_git_dir(&fx.store).unwrap();
     // Detached computation retains its new objects under refs/jj/keep;
@@ -1078,7 +1124,7 @@ async fn detached_landing_keeps_live_coordinates_until_journaled_install() {
         ];
         let prospect = prospective_default_landing(
             &fx.orch,
-            &fx.ctx,
+            &LandingSubject::from(&fx.ctx),
             method,
             &prepared.base_commit,
             &prepared.head_after,
@@ -1184,3 +1230,5 @@ fn default_and_approval_install_only_after_durable_intent() {
         );
     }
 }
+
+mod request_landing;

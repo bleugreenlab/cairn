@@ -95,6 +95,11 @@ pub struct ProjectSettingsFile {
     /// docs/checks.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_bumps: Option<BTreeMap<String, PinBumpSpec>>,
+    /// Commands an operator may approve by name, keyed by that name. Read
+    /// from the default branch's tip, never a branch's, so no branch can
+    /// declare the command it asks to have approved. See docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_commands: Option<BTreeMap<String, ApprovedCommandSpec>>,
     /// How the store lands work: which registry files merge by structure
     /// rather than by lines. Read from the commit being landed onto, never from
     /// the branch being landed, so no branch can change the rules it lands by.
@@ -233,6 +238,305 @@ impl PinBumpSpec {
             })
             .collect()
     }
+}
+
+/// The most bytes an approved command's `command` may hold.
+pub const APPROVED_COMMAND_MAX_BYTES: usize = 16 * 1024;
+
+/// One project-declared command an operator may approve by name
+/// (`approvedCommands`): what it is called, what approving it will do, the
+/// parameters the approval supplies, and the command those fill in. Read from
+/// the default branch's tip, so no branch can declare the command it asks for.
+/// Unknown keys are refused: a misspelled `land` would otherwise run the
+/// command and land nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovedCommandSpec {
+    /// What the approval is called where it is asked for.
+    pub label: String,
+    /// What approving it does, in the operator's terms. May name params as
+    /// `{name}`, which the approval shows filled in.
+    pub consequence: String,
+    /// The values an approval supplies, by placeholder name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ApprovedCommandParam>,
+    /// The shell command, its `{name}` placeholders filled from `params`.
+    pub command: String,
+    /// Where the command may run: the toolchains it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ApprovedCommandExecutor>,
+    /// Seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// The one commit the command's changes seal into and land on the
+    /// default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lands: Option<ApprovedCommandLands>,
+    /// What follows the landing under the same approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then: Option<ApprovedCommandThen>,
+}
+
+/// Where an approved command may run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovedCommandExecutor {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_toolchains: Vec<String>,
+}
+
+/// One value an approval supplies to its command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ApprovedCommandParam {
+    /// A release version, offered relative to the one `current` reads.
+    ReleaseVersion { current: VersionSource },
+    /// One of a fixed list of values.
+    Choice { values: Vec<String> },
+}
+
+/// Where a project's current version is read: a string at a top-level key of
+/// a repo-relative JSON file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VersionSource {
+    pub path: String,
+    pub json_key: String,
+}
+
+/// The commit an approved command lands: only changes inside `paths` are
+/// sealed, under `message` (which may name params as `{name}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovedCommandLands {
+    /// Repo-relative globs (`*` stays within a path segment, `**` crosses
+    /// them).
+    pub paths: Vec<String>,
+    pub message: String,
+}
+
+/// What an approved command chains into once its commit has landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovedCommandThen {
+    /// Rebuild and reinstall the desktop app at exactly the landed commit.
+    Rebuild,
+}
+
+impl ApprovedCommandSpec {
+    /// The names inside `{...}` in `text`, in order of first appearance and
+    /// deduplicated. A `{` with no closing `}` ends the scan; validation
+    /// refuses it.
+    pub fn placeholders(text: &str) -> Vec<String> {
+        scan_placeholders(text).0
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.label.trim().is_empty() {
+            return Err("`label` is blank".into());
+        }
+        if self.consequence.trim().is_empty() {
+            return Err("`consequence` is blank".into());
+        }
+        for (name, param) in &self.params {
+            if !is_param_name(name) {
+                return Err(format!(
+                    "param `{name}` is not a name like `version` (a lowercase letter, then letters, digits or `_`)"
+                ));
+            }
+            param
+                .validate()
+                .map_err(|error| format!("params.{name}: {error}"))?;
+        }
+        if self.command.trim().is_empty() {
+            return Err("`command` is blank".into());
+        }
+        if self.command.len() > APPROVED_COMMAND_MAX_BYTES {
+            return Err(format!(
+                "`command` is {} bytes, over the {APPROVED_COMMAND_MAX_BYTES}-byte limit",
+                self.command.len()
+            ));
+        }
+        if self.command.contains('\0') {
+            return Err("`command` contains a NUL byte".into());
+        }
+        self.check_placeholders("command", &self.command)?;
+        self.check_placeholders("consequence", &self.consequence)?;
+        if let Some(timeout) = self.timeout {
+            let ceiling = u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS);
+            if timeout == 0 {
+                return Err("`timeout` is a positive number of seconds".into());
+            }
+            if timeout.checked_mul(1_000).is_none_or(|ms| ms > ceiling) {
+                return Err(format!(
+                    "`timeout` of {timeout} s is past the {} s batch ceiling",
+                    ceiling / 1_000
+                ));
+            }
+        }
+        if let Some(lands) = &self.lands {
+            if lands.paths.is_empty() {
+                return Err("`lands.paths` names no paths".into());
+            }
+            for path in &lands.paths {
+                validate_repo_glob(path).map_err(|error| format!("lands.paths: {error}"))?;
+            }
+            if lands.message.trim().is_empty() {
+                return Err("`lands.message` is blank".into());
+            }
+            self.check_placeholders("lands.message", &lands.message)?;
+        } else if self.then.is_some() {
+            return Err("`then` follows a landing, and this command declares no `lands`".into());
+        }
+        Ok(())
+    }
+
+    /// Every placeholder in `text` is closed and names a declared param.
+    fn check_placeholders(&self, field: &str, text: &str) -> Result<(), String> {
+        let (names, unclosed) = scan_placeholders(text);
+        if let Some(error) = unclosed {
+            return Err(format!("`{field}`: {error}"));
+        }
+        for name in names {
+            if !self.params.contains_key(&name) {
+                return Err(format!(
+                    "`{field}` names `{{{name}}}`, which is not a declared param"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ApprovedCommandParam {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::ReleaseVersion { current } => {
+                validate_repo_relative(&current.path)
+                    .map_err(|error| format!("current.path: {error}"))?;
+                if current.json_key.trim().is_empty() {
+                    return Err("`current.jsonKey` is blank".into());
+                }
+                Ok(())
+            }
+            Self::Choice { values } => {
+                if values.is_empty() {
+                    return Err("a `choice` offers at least one value".into());
+                }
+                for value in values {
+                    let plain = !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                    if !plain {
+                        return Err(format!(
+                            "choice value `{value}` is not made of letters, digits, `.`, `_` and `-`"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The `{...}` names in `text` (in order, deduplicated), and the refusal for
+/// a `{` left unclosed, which ends the scan.
+fn scan_placeholders(text: &str) -> (Vec<String>, Option<String>) {
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            return (
+                names,
+                Some(format!(
+                    "`{}` opens a placeholder it never closes",
+                    &rest[open..]
+                )),
+            );
+        };
+        let name = &after[..close];
+        if !names.iter().any(|seen| seen == name) {
+            names.push(name.to_string());
+        }
+        rest = &after[close + 1..];
+    }
+    (names, None)
+}
+
+/// `^[a-z][a-z0-9-]*$`
+fn is_approved_command_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// `^[a-z][a-zA-Z0-9_]*$`
+fn is_param_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A nonblank path inside the repository: not absolute, no `..` component.
+fn validate_repo_relative(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("a path is blank".into());
+    }
+    if path.contains('\0') {
+        return Err(format!("`{path}` contains a NUL byte"));
+    }
+    let drive = path.as_bytes().get(1) == Some(&b':');
+    if path.starts_with('/') || path.starts_with('\\') || drive {
+        return Err(format!("`{path}` is absolute; paths are repo-relative"));
+    }
+    if path.split(['/', '\\']).any(|component| component == "..") {
+        return Err(format!("`{path}` climbs out of the repository with `..`"));
+    }
+    Ok(())
+}
+
+/// A repo-relative glob whose `[...]` classes and `{...}` alternations close.
+fn validate_repo_glob(glob: &str) -> Result<(), String> {
+    validate_repo_relative(glob)?;
+    let mut in_class = false;
+    let mut alternation_depth = 0usize;
+    for c in glob.chars() {
+        match c {
+            ']' if in_class => in_class = false,
+            _ if in_class => {}
+            '[' => in_class = true,
+            '{' => alternation_depth += 1,
+            '}' if alternation_depth == 0 => {
+                return Err(format!("`{glob}` closes a `{{` it never opened"));
+            }
+            '}' => alternation_depth -= 1,
+            _ => {}
+        }
+    }
+    if in_class || alternation_depth > 0 {
+        return Err(format!("`{glob}` leaves a `[` or `{{` unclosed"));
+    }
+    Ok(())
+}
+
+/// What the deserializer cannot say about `approvedCommands`: each name, and
+/// each declaration's fields taken together. The first refusal names the
+/// command it belongs to, and fails the whole file.
+pub fn validate_approved_commands(
+    map: &BTreeMap<String, ApprovedCommandSpec>,
+) -> Result<(), String> {
+    for (name, spec) in map {
+        if !is_approved_command_name(name) {
+            return Err(format!(
+                "approvedCommands.{name}: `{name}` is not a name like `bump` (a lowercase letter, then lowercase letters, digits or `-`)"
+            ));
+        }
+        spec.validate()
+            .map_err(|error| format!("approvedCommands.{name}: {error}"))?;
+    }
+    Ok(())
 }
 
 /// The `landing` section of `.cairn/config.yaml`.
@@ -458,6 +762,8 @@ struct LegacyProjectSettingsFile {
     landing: Option<LandingSettings>,
     #[serde(default)]
     pin_bumps: Option<BTreeMap<String, PinBumpSpec>>,
+    #[serde(default)]
+    approved_commands: Option<BTreeMap<String, ApprovedCommandSpec>>,
     #[serde(default)]
     scratch: Option<ScratchSettings>,
     #[serde(default)]
@@ -775,6 +1081,7 @@ fn parse_project_settings_under(
         contextual_packages: legacy.contextual_packages,
         landing: legacy.landing,
         pin_bumps: legacy.pin_bumps,
+        approved_commands: legacy.approved_commands,
         scratch: legacy.scratch,
         requires: legacy.requires,
         check_budgets: legacy.check_budgets,
@@ -790,6 +1097,10 @@ fn parse_project_settings_under(
                 format!("Failed to parse project config file: landing.regenerate[{index}]: {error}")
             })?;
         }
+    }
+    if let Some(commands) = &settings.approved_commands {
+        validate_approved_commands(commands)
+            .map_err(|error| format!("Failed to parse project config file: {error}"))?;
     }
 
     Ok((settings, needs_migration))
@@ -1151,6 +1462,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "contextualPackages",
     "landing",
     "pinBumps",
+    "approvedCommands",
     "checkBudgets",
     "publish",
     // Legacy keys the load-path migration strips.
@@ -2032,6 +2344,160 @@ pinBumps:
             "pinBumps:\n  codex:\n    pin: p.json\n    froze: [integration]\n    checks: [a]\n    platforms: [linux]\n";
         let error = parse_project_settings(misspelled).unwrap_err();
         assert!(error.contains("froze"), "{error}");
+    }
+
+    const APPROVED_BUMP: &str = r#"
+approvedCommands:
+  bump:
+    label: Bump Cairn's version
+    consequence: >-
+      Sets {version} in package.json and lands that one commit.
+    params:
+      version:
+        type: releaseVersion
+        current: {path: package.json, jsonKey: version}
+    command: bun run bumpver --files-only {version}
+    executor: {requiredToolchains: [bun, rust]}
+    timeout: 600
+    lands:
+      paths: [package.json, changelog/**]
+      message: "Bump version to {version}"
+    then: rebuild
+"#;
+
+    #[test]
+    fn approved_commands_parse_and_round_trip() {
+        let (settings, _) = parse_project_settings(APPROVED_BUMP).unwrap();
+        let commands = settings.approved_commands.as_ref().unwrap();
+        assert_eq!(
+            commands.get("bump"),
+            Some(&ApprovedCommandSpec {
+                label: "Bump Cairn's version".into(),
+                consequence: "Sets {version} in package.json and lands that one commit.".into(),
+                params: BTreeMap::from([(
+                    "version".to_string(),
+                    ApprovedCommandParam::ReleaseVersion {
+                        current: VersionSource {
+                            path: "package.json".into(),
+                            json_key: "version".into(),
+                        },
+                    },
+                )]),
+                command: "bun run bumpver --files-only {version}".into(),
+                executor: Some(ApprovedCommandExecutor {
+                    required_toolchains: vec!["bun".into(), "rust".into()],
+                }),
+                timeout: Some(600),
+                lands: Some(ApprovedCommandLands {
+                    paths: vec!["package.json".into(), "changelog/**".into()],
+                    message: "Bump version to {version}".into(),
+                }),
+                then: Some(ApprovedCommandThen::Rebuild),
+            })
+        );
+        let serialized = serde_yaml::to_string(&settings).unwrap();
+        assert!(serialized.contains("approvedCommands:"), "{serialized}");
+        let (reparsed, _) = parse_project_settings(&serialized).unwrap();
+        assert_eq!(reparsed.approved_commands, settings.approved_commands);
+    }
+
+    #[test]
+    fn approved_command_placeholders_are_ordered_and_deduplicated() {
+        assert_eq!(
+            ApprovedCommandSpec::placeholders("{b} then {a}, again {b}"),
+            ["b", "a"]
+        );
+        assert_eq!(ApprovedCommandSpec::placeholders("{a} and {open"), ["a"]);
+    }
+
+    #[test]
+    fn approved_commands_refuse_bad_declarations_naming_the_command() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "    timeout: 600\n",
+                "    timeout: 600\n    retries: 2\n",
+                "retries",
+            ),
+            (
+                "    then: rebuild\n",
+                "    then: rebuild\n    timeout2: 1\n",
+                "timeout2",
+            ),
+            ("{version}\"", "{versoin}\"", "versoin"),
+            (
+                "command: bun run bumpver --files-only {version}",
+                "command: bun run x {version",
+                "never closes",
+            ),
+            ("    timeout: 600\n", "    timeout: 21601\n", "ceiling"),
+            ("    timeout: 600\n", "    timeout: 0\n", "positive"),
+            ("[package.json, changelog/**]", "[../outside]", ".."),
+            ("[package.json, changelog/**]", "[/etc/passwd]", "absolute"),
+            ("[package.json, changelog/**]", "[\"src/[ab\"]", "unclosed"),
+            ("{path: package.json,", "{path: /package.json,", "absolute"),
+            ("jsonKey: version", "jsonKey: \" \"", "jsonKey"),
+        ];
+        for (from, to, expected) in cases {
+            assert!(APPROVED_BUMP.contains(from), "fixture lacks {from}");
+            let yaml = APPROVED_BUMP.replacen(from, to, 1);
+            let error = parse_project_settings(&yaml).unwrap_err();
+            assert!(error.contains(expected), "{to}: {error}");
+        }
+
+        let without_lands = APPROVED_BUMP
+            .replacen("    lands:\n      paths: [package.json, changelog/**]\n      message: \"Bump version to {version}\"\n", "", 1);
+        let error = parse_project_settings(&without_lands).unwrap_err();
+        assert!(error.contains("approvedCommands.bump"), "{error}");
+        assert!(error.contains("`then`"), "{error}");
+
+        let bad_name = APPROVED_BUMP.replacen("  bump:", "  Bump_It:", 1);
+        let error = parse_project_settings(&bad_name).unwrap_err();
+        assert!(error.contains("approvedCommands.Bump_It"), "{error}");
+
+        let choice = APPROVED_BUMP.replacen(
+            "        type: releaseVersion\n        current: {path: package.json, jsonKey: version}\n",
+            "        type: choice\n        values: [patch, \"minor version\"]\n",
+            1,
+        );
+        let error = parse_project_settings(&choice).unwrap_err();
+        assert!(
+            error.contains("approvedCommands.bump: params.version"),
+            "{error}"
+        );
+        assert!(error.contains("minor version"), "{error}");
+
+        let empty_choice = APPROVED_BUMP.replacen(
+            "        type: releaseVersion\n        current: {path: package.json, jsonKey: version}\n",
+            "        type: choice\n        values: []\n",
+            1,
+        );
+        assert!(parse_project_settings(&empty_choice).is_err());
+
+        let good_choice = choice.replacen("\"minor version\"", "minor", 1);
+        parse_project_settings(&good_choice).unwrap();
+    }
+
+    /// Cairn's own `bump` declaration parses and chains into a rebuild. Read
+    /// at runtime and skipped when absent: the public mirror carries no
+    /// `.cairn/`.
+    #[test]
+    fn the_repository_config_declares_the_bump_command() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cairn/config.yaml");
+        let Ok(repository) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let (settings, _) = parse_project_settings(&repository).unwrap();
+        let bump = settings
+            .approved_commands
+            .as_ref()
+            .and_then(|commands| commands.get("bump"))
+            .expect("the repository config declares approvedCommands.bump");
+        assert_eq!(bump.then, Some(ApprovedCommandThen::Rebuild));
+        assert!(bump.lands.is_some());
+        assert!(matches!(
+            bump.params.get("version"),
+            Some(ApprovedCommandParam::ReleaseVersion { .. })
+        ));
     }
 
     #[test]

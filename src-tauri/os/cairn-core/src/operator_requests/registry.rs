@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::AcceptedRequestContext;
@@ -16,7 +15,7 @@ use cairn_common::requests::{
     FencedCommandAcceptance, RequestAcceptance, RequestAttemptOutcome, RequestKind,
 };
 
-pub const REGISTERED_KINDS: &[&str] = &["rebuild", "bump_version", "lift_drain", "fenced_command"];
+pub const REGISTERED_KINDS: &[&str] = &["rebuild", "lift_drain", "fenced_command"];
 
 pub use cairn_common::requests::AcceptancePolicy;
 
@@ -33,25 +32,20 @@ pub const DEFINITIONS: &[KindDefinition] = &[
         name: "rebuild",
         actor: "devops.rebuild",
         dependency: "the macOS rebuild consumer, which only a macOS runner registers",
-        acceptance_policy: AcceptancePolicy::OperatorCredential,
-    },
-    KindDefinition {
-        name: "bump_version",
-        actor: "devops.rebuild",
-        dependency: "cairn/6387 request-driven bump/landing adapter, cairn/6386 rebuild launch and cairn/6385 fleet phases",
-        acceptance_policy: AcceptancePolicy::OperatorCredential,
+        acceptance_policy: RequestKind::Rebuild.acceptance_policy(),
     },
     KindDefinition {
         name: "lift_drain",
         actor: "execution.fleet",
         dependency: "cairn/6383 execution-owned generation-attributed FleetConfig drain adapter",
-        acceptance_policy: AcceptancePolicy::OperatorCredential,
+        acceptance_policy: RequestKind::LiftDrain.acceptance_policy(),
     },
     KindDefinition {
         name: "fenced_command",
         actor: super::fenced_command::ACTOR,
-        dependency: "the fenced_command consumer, which dispatches through the fleet's operator-act path",
-        acceptance_policy: AcceptancePolicy::LocalUserVerification,
+        dependency:
+            "the fenced_command consumer, which dispatches through the fleet's operator-act path",
+        acceptance_policy: RequestKind::FencedCommand.acceptance_policy(),
     },
 ];
 
@@ -65,62 +59,6 @@ pub fn definition(kind: &str) -> Result<&'static KindDefinition, String> {
                 REGISTERED_KINDS.join(", ")
             )
         })
-}
-
-/// Plain release versions only: request targets cannot smuggle prerelease or
-/// build metadata into the bump actor's restricted transformation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct ReleaseVersion(pub u64, pub u64, pub u64);
-
-impl ReleaseVersion {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        let invalid = || {
-            format!("Invalid bump_version target '{value}': use sm, md, lg or plain X.Y.Z (no prerelease/build metadata)")
-        };
-        let parts: Vec<_> = value.split('.').collect();
-        if parts.len() != 3 {
-            return Err(invalid());
-        }
-        let mut numbers = [0; 3];
-        for (index, part) in parts.iter().enumerate() {
-            if part.is_empty()
-                || !part.bytes().all(|byte| byte.is_ascii_digit())
-                || (part.len() > 1 && part.starts_with('0'))
-            {
-                return Err(invalid());
-            }
-            numbers[index] = part.parse().map_err(|_| invalid())?;
-        }
-        Ok(Self(numbers[0], numbers[1], numbers[2]))
-    }
-
-    pub(crate) fn resolve(self, requested: &str) -> Result<Self, String> {
-        let overflow = || "bump_version target overflows a release version component".to_string();
-        match requested {
-            "sm" => Ok(Self(
-                self.0,
-                self.1,
-                self.2.checked_add(1).ok_or_else(overflow)?,
-            )),
-            "md" => Ok(Self(self.0, self.1.checked_add(1).ok_or_else(overflow)?, 0)),
-            "lg" => Ok(Self(self.0.checked_add(1).ok_or_else(overflow)?, 0, 0)),
-            explicit => {
-                let target = Self::parse(explicit)?;
-                if target <= self {
-                    return Err(format!(
-                        "bump_version target {target} must be greater than running version {self}"
-                    ));
-                }
-                Ok(target)
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for ReleaseVersion {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}.{}.{}", self.0, self.1, self.2)
-    }
 }
 
 /// Trusted source state comes from the registered runner component, never the
@@ -290,6 +228,15 @@ pub(crate) fn act_digest(
                 &witness.floor_measured_at_unix_ms.to_string(),
             );
             encoder.field("scratch_head", fenced.scratch_head.as_deref().unwrap_or(""));
+            // Bound beside the target that already encodes it, so the
+            // binding names the declaration's commit and digest by field.
+            // Absent for a raw act, whose digest is unchanged.
+            if let Some(declared) = &act.declaration {
+                encoder.field(
+                    "declaration",
+                    &serde_json::to_string(declared).unwrap_or_default(),
+                );
+            }
         }
     })
 }
@@ -315,36 +262,5 @@ mod tests {
             assert!(error.contains(entry.dependency));
             assert!(error.contains("UNAVAILABLE"));
         }
-    }
-
-    #[test]
-    fn release_targets_are_strict_and_tiers_fix_minimum_at_filing() {
-        let running = ReleaseVersion::parse("1.2.3").unwrap();
-        assert_eq!(running.resolve("sm").unwrap().to_string(), "1.2.4");
-        assert_eq!(running.resolve("md").unwrap().to_string(), "1.3.0");
-        assert_eq!(running.resolve("lg").unwrap().to_string(), "2.0.0");
-        assert_eq!(running.resolve("2.1.0").unwrap().to_string(), "2.1.0");
-        for bad in [
-            "1.2",
-            "01.2.3",
-            "1.2.3-alpha",
-            "1.2.4+build",
-            "+1.2.4",
-            " 1.2.4",
-            "1.2.3",
-            "0.9.0",
-        ] {
-            assert!(running.resolve(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn smaller_explicit_target_never_reduces_another_contribution_minimum() {
-        let running = ReleaseVersion(1, 2, 3);
-        let minimums = [
-            running.resolve("lg").unwrap(),
-            running.resolve("1.2.9").unwrap(),
-        ];
-        assert_eq!(minimums.into_iter().max().unwrap(), ReleaseVersion(2, 0, 0));
     }
 }

@@ -505,6 +505,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("pr_publish_attempts", "action_runs"),
     owned("pack_catalog_backfill_attempts", "execution_history"),
     owned("pack_catalog_references", "pack_catalog"),
+    // An operator request's rows name no merge request (merge_request_id is
+    // NULL, and a NULL never cascades), so they live as long as their project.
     owned("merge_attempt_events", "merge_requests"),
     // One row per resolution, a few kilobytes since lane_snapshot stopped
     // copying the execution snapshot (cairn/6257); the merge-time lane record
@@ -635,6 +637,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned_by("request_facts", "storage::requests::prune", "retain accepted facts and latest 8 versions per cohort"),
     owned_by("request_outbox", "storage::requests::prune", "delivered items expire after 7 days; pending intents retained"),
     owned("request_report_receipts", "request_attempts"),
+    // At most one row per parent attempt whose act chains into another kind.
+    owned("request_chains", "request_attempts"),
     keep("served_api_clients", IDENTITY),
     keep("subscription_periods", IDENTITY),
     keep("github_app", IDENTITY),

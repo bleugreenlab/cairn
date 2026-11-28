@@ -81,8 +81,8 @@ pub use recovery::{
     StoreValidation, SurvivorRecord,
 };
 pub use retire::{
-    local_bookmark_names, read_local_branch_state, retire_bookmark_expecting, LocalBranchState,
-    Retirement,
+    create_bookmark_expecting_absent, local_bookmark_names, read_local_branch_state,
+    retire_bookmark_expecting, LocalBranchState, Retirement,
 };
 pub use seal::*;
 pub use three_way::*;

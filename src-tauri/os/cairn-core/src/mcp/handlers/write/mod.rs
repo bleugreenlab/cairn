@@ -1540,7 +1540,7 @@ async fn handle_write_attempt(
         publication_base.as_ref(),
     ) {
         let coordinate_matches = prepared.coordinate.branch == resolution.rev
-            && prepared.coordinate.relationship.base_branch == base.branch
+            && prepared.coordinate.base_branch() == base.branch
             && prepared.coordinate.base_commit == base.commit;
         let coherent = if !coordinate_matches {
             false

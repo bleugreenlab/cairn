@@ -65,6 +65,91 @@ pub struct MergeMrContext {
     pub(crate) has_triage_batch: bool,
 }
 
+/// Who a landing is journaled under, and so how its recovery finds it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LandingJournal {
+    /// A pull request's merge: its `merge_requests` row and the job that owns
+    /// it.
+    MergeRequest { mr_id: String, job_id: String },
+    /// An accepted operator request's sealed commit. Nothing else owns it: no
+    /// job and no merge request.
+    OperatorRequest { attempt_id: String },
+}
+
+/// What the landing core reads of the change it lands, and nothing more: the
+/// project and its checkout, whether the project has a remote, the source,
+/// target and default branches, the issue a landing is admitted for, the
+/// squash title, and whose journal the landing is recorded in.
+///
+/// A pull request's merge builds it from its [`MergeMrContext`]. An operator
+/// request builds it from its accepted act, with no issue and no merge
+/// request, so the one landing core serves both without either reading what
+/// only the other has.
+#[derive(Debug, Clone)]
+pub(crate) struct LandingSubject {
+    pub(crate) project_id: String,
+    pub(crate) repo_path: String,
+    /// The project has no remote: the landing is a store fold, never pushed.
+    pub(crate) is_local: bool,
+    pub(crate) source_branch: String,
+    pub(crate) target_branch: String,
+    pub(crate) default_branch: String,
+    pub(crate) issue_id: Option<String>,
+    pub(crate) title: String,
+    pub(crate) journal: LandingJournal,
+}
+
+impl LandingSubject {
+    /// The merge request the landing records, if it has one.
+    pub(crate) fn merge_request_id(&self) -> Option<&str> {
+        match &self.journal {
+            LandingJournal::MergeRequest { mr_id, .. } => Some(mr_id),
+            LandingJournal::OperatorRequest { .. } => None,
+        }
+    }
+
+    /// The id the journal's `job_id` column carries: the owning job, or the
+    /// operator request's attempt (migration 0019's owner convention).
+    pub(crate) fn owner_id(&self) -> &str {
+        match &self.journal {
+            LandingJournal::MergeRequest { job_id, .. } => job_id,
+            LandingJournal::OperatorRequest { attempt_id } => attempt_id,
+        }
+    }
+
+    /// The record a refusal names: the merge request, or the attempt.
+    pub(crate) fn record_id(&self) -> &str {
+        match &self.journal {
+            LandingJournal::MergeRequest { mr_id, .. } => mr_id,
+            LandingJournal::OperatorRequest { attempt_id } => attempt_id,
+        }
+    }
+
+    /// Whether an operator request, rather than a pull request, is landing.
+    pub(crate) fn is_operator_request(&self) -> bool {
+        matches!(self.journal, LandingJournal::OperatorRequest { .. })
+    }
+}
+
+impl From<&MergeMrContext> for LandingSubject {
+    fn from(context: &MergeMrContext) -> Self {
+        Self {
+            project_id: context.project_id.clone(),
+            repo_path: context.mr.repo_path.clone(),
+            is_local: context.mr.is_local,
+            source_branch: context.source_branch.clone(),
+            target_branch: context.target_branch.clone(),
+            default_branch: context.default_branch.clone(),
+            issue_id: context.issue_id.clone(),
+            title: context.title.clone(),
+            journal: LandingJournal::MergeRequest {
+                mr_id: context.mr.mr_id.clone(),
+                job_id: context.mr.job_id.clone(),
+            },
+        }
+    }
+}
+
 pub(super) fn db_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
@@ -294,6 +379,8 @@ pub async fn resolve_merge_mr_context_for_job(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<MergeMrContext, String> {
+    #[cfg(test)]
+    resolution_probe::record(job_id);
     let mr = resolve_mr_context_for_job(db, job_id).await?;
     let mr_id = mr.mr_id.clone();
 
@@ -348,6 +435,27 @@ pub async fn resolve_merge_mr_context_for_job(
         is_workspace,
         has_triage_batch,
     })
+}
+
+/// Every owner id [`resolve_merge_mr_context_for_job`] was asked about, so a
+/// test can prove a path never resolved an id as a job's merge request.
+#[cfg(test)]
+pub(crate) mod resolution_probe {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn asked() -> &'static Mutex<HashSet<String>> {
+        static ASKED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        ASKED.get_or_init(Default::default)
+    }
+
+    pub(super) fn record(owner_id: &str) {
+        asked().lock().unwrap().insert(owner_id.to_string());
+    }
+
+    pub(crate) fn asked_about(owner_id: &str) -> bool {
+        asked().lock().unwrap().contains(owner_id)
+    }
 }
 
 pub(super) async fn load_mr_issue_id(db: &LocalDb, mr_id: &str) -> Result<Option<String>, String> {

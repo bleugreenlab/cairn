@@ -5,9 +5,9 @@
 //! fence, and a value only the request consumer can build.
 
 use cairn_common::executor_protocol::{
-    CellCommandClass, CellOutcome, CellRequest, ExecutorSelector, MutationPolicy,
-    PlacementMobility, PlacementWorkClass, ProcessBatch, ProcessBatchExecution, ProcessBatchItem,
-    ProcessSandboxMode, RepositoryLocator,
+    CellCommandClass, CellOutcome, CellRequest, ExecutorSelector, PlacementMobility,
+    PlacementWorkClass, ProcessBatch, ProcessBatchExecution, ProcessBatchItem, ProcessSandboxMode,
+    RepositoryLocator,
 };
 use cairn_common::run_contract::RUN_BATCH_CEILING_MS;
 use cairn_common::wire_vocabulary::CellPriority;
@@ -31,7 +31,7 @@ pub(super) fn operator_act_request(act: &OperatorAct) -> CellRequest {
             repository_id: frozen.project_id.clone(),
             absolute_path: act.repository().to_string(),
         },
-        base_commit: frozen.commit.clone(),
+        base_commit: act.base_commit().to_string(),
         publication: None,
         command_class: CellCommandClass::classify(&frozen.command),
         placement_work_class: PlacementWorkClass::AgentSessions,
@@ -43,9 +43,10 @@ pub(super) fn operator_act_request(act: &OperatorAct) -> CellRequest {
         wait_horizon_unix_ms: now.saturating_add(u64::from(RUN_BATCH_CEILING_MS)),
         waiting_since_unix_ms: now,
         timeout_ms: frozen.timeout_ms,
-        // Tracked changes are discarded with the cell; what the act is for is
-        // what it writes outside the checkout.
-        mutation_policy: MutationPolicy::PureVerdict,
+        // Tracked changes are discarded with the cell, unless the act is a
+        // declared `lands` act, whose changes come back to be sealed and
+        // landed by its consumer.
+        mutation_policy: act.mutation_policy(),
         requesting_job_id: None,
         affinity_key: None,
         // Placement may only choose a machine whose credential floor is
@@ -100,11 +101,13 @@ pub(super) fn operator_act_batch(act: &OperatorAct, runner_context_id: String) -
 }
 
 impl Fleet {
+    /// Run the act once. Returns the cell request as placement prepared it,
+    /// which a returned delta is sealed against, with the outcome.
     pub(crate) async fn submit_operator_act(
         &self,
         orch: &Orchestrator,
         act: &OperatorAct,
-    ) -> CellOutcome {
+    ) -> (CellRequest, CellOutcome) {
         let runner_context_id = uuid::Uuid::new_v4().to_string();
         let output = output_guard::RelayedOutput::shared();
         self.runner_contexts.lock().unwrap().insert(
@@ -128,13 +131,13 @@ impl Fleet {
         let batch = operator_act_batch(act, runner_context_id.clone());
         let outcome = match self.prepare_execution(orch, &mut request).await {
             Ok(prepared) => {
-                self.execute_prepared(orch, request, Some(batch), prepared)
+                self.execute_prepared(orch, request.clone(), Some(batch), prepared)
                     .await
             }
             Err(outcome) => outcome,
         };
         output_guard::flush_batch_output(orch, &output, None);
         self.settle_runner_context(&runner_context_id);
-        outcome
+        (request, outcome)
     }
 }

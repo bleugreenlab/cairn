@@ -571,6 +571,7 @@ mod tests {
             policy_project_id: None,
             drain: None,
             fenced_command: None,
+            chained_from: None,
             operator: principal.clone(),
             appearance: AppearanceSnapshot::new(principal, evidence, vec![], None).unwrap(),
             accepted_at: 1,
@@ -595,6 +596,9 @@ mod tests {
             cell_request_id: "cell".into(),
             cell_attempt_id: "cell-attempt".into(),
             detail: Some("scratch written back".into()),
+            landed_commit: None,
+            sealed_commit: None,
+            base: None,
         }, "builtCommit": null})
     }
 

@@ -44,23 +44,6 @@ fn id() -> String {
 fn nonblank(s: &str) -> bool {
     !s.trim().is_empty()
 }
-fn version(s: &str) -> DbResult<(u64, u64, u64)> {
-    let n: Vec<_> = s.split('.').collect();
-    if n.len() != 3
-        || n.iter().any(|s| {
-            s.is_empty()
-                || (s.len() > 1 && s.starts_with('0'))
-                || !s.bytes().all(|b| b.is_ascii_digit())
-        })
-    {
-        return Err(error("expected canonical X.Y.Z target"));
-    }
-    Ok((
-        n[0].parse().map_err(|_| error("version overflow"))?,
-        n[1].parse().map_err(|_| error("version overflow"))?,
-        n[2].parse().map_err(|_| error("version overflow"))?,
-    ))
-}
 async fn text<P: crate::turso::params::IntoParams + Send>(
     conn: &TrackedConnection,
     sql: &str,
@@ -176,6 +159,7 @@ async fn get_conn(conn: &TrackedConnection, request: &str) -> DbResult<Option<Op
         requesters: vec![],
         facts: None,
         attempts: vec![],
+        chains: vec![],
         available: false,
         unavailable_reason: Some(
             "consumer availability is supplied by the registered runner service".into(),
@@ -224,6 +208,25 @@ async fn get_conn(conn: &TrackedConnection, request: &str) -> DbResult<Option<Op
     let mut rows=conn.query(format!("SELECT DISTINCT {ATTEMPT_COLUMNS} FROM request_attempts a JOIN request_attempt_members m ON m.attempt_id=a.id WHERE m.request_id IN (SELECT request_id FROM request_cohort_members WHERE cohort_id=?1) ORDER BY a.updated_at,a.id"),params![out.cohort_id.clone()]).await?;
     while let Some(r) = rows.next().await? {
         out.attempts.push(attempt_row(&r)?);
+    }
+    drop(rows);
+    for attempt in &out.attempts {
+        let Some(chain) = chain_conn(conn, &attempt.id).await? else {
+            continue;
+        };
+        let child_request_uri = match &chain.child_request_id {
+            Some(child) => Some(request_uri_conn(conn, child).await?),
+            None => None,
+        };
+        out.chains.push(RequestChainLink {
+            parent_attempt_id: chain.parent_attempt_id,
+            kind: chain.kind,
+            commit: chain.commit,
+            state: chain.state,
+            deadline_unix_ms: chain.deadline_unix_ms,
+            child_request_uri,
+            refusal: chain.refusal,
+        });
     }
     Ok(Some(out))
 }
@@ -356,10 +359,10 @@ async fn changed_many(
     }
     Ok(())
 }
-/// Recomputes only mutable open targets from immutable filing minimums.
+/// Recomputes each member's state and the cohort's open target from its
+/// active, unsatisfied contributions.
 async fn recompute(conn: &TrackedConnection, cohort: &str, now: i64) -> DbResult<()> {
     let ids = members(conn, cohort).await?;
-    let mut minimum: Option<(u64, u64, u64)> = None;
     let mut target = None;
     let mut any = false;
     let mut any_active = false;
@@ -369,27 +372,12 @@ async fn recompute(conn: &TrackedConnection, cohort: &str, now: i64) -> DbResult
             .ok_or_else(|| error("missing cohort member"))?;
         let own = contributions(conn, m).await?;
         any_active |= own.iter().any(|c| c.active);
-        let active: Vec<_> = own
+        if own
             .iter()
-            .filter(|c| c.active && c.satisfied_by_attempt.is_none())
-            .collect();
-        if !active.is_empty() {
+            .any(|c| c.active && c.satisfied_by_attempt.is_none())
+        {
             any = true;
-            if r.kind == RequestKind::BumpVersion {
-                for c in active {
-                    let s = c
-                        .minimum_target
-                        .as_deref()
-                        .ok_or_else(|| error("bump contribution missing minimum"))?;
-                    let v = version(s)?;
-                    if minimum.is_none_or(|n| v > n) {
-                        minimum = Some(v);
-                        target = Some(s.to_string());
-                    }
-                }
-            } else {
-                target = r.target;
-            }
+            target = r.target;
         }
         let state = if own.iter().any(|c| c.active) {
             if own
@@ -449,55 +437,96 @@ pub async fn file_request(
             "filing requires normalized identity and verified run attribution",
         ));
     }
-    if input.kind == RequestKind::BumpVersion {
-        version(
-            input
-                .contribution
-                .minimum_target
-                .as_deref()
-                .ok_or_else(|| error("missing bump minimum"))?,
-        )?;
-    }
-    db.exclusive(move |conn| { let input=input_owned.clone(); Box::pin(async move {let input=&input;
-        let existing=text(conn,"SELECT id FROM request_cohorts WHERE workspace_id=?1 AND coalescing_key=?2 AND state='open'",params![input.workspace_id.clone(),input.coalescing_key.clone()]).await?;
-        let created=existing.is_none();
-        let cohort=existing.unwrap_or_else(id);
-        let request=if created {
-            let r=id();
-            conn.execute("INSERT INTO request_cohorts(id,workspace_id,coalescing_key,kind,state,created_at,updated_at) VALUES(?1,?2,?3,?4,'open',?5,?5)",params![cohort.clone(),input.workspace_id.clone(),input.coalescing_key.clone(),input.kind.as_str(),now]).await?;
-            conn.execute("INSERT INTO requests(id,workspace_id,kind,target,target_identity,coalescing_key,cohort_id,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'open',?8,?8)",params![r.clone(),input.workspace_id.clone(),input.kind.as_str(),input.target.clone(),input.target_identity.clone(),input.coalescing_key.clone(),cohort.clone(),now]).await?;
-            conn.execute("INSERT INTO request_cohort_members(cohort_id,request_id) VALUES(?1,?2)",params![cohort.clone(),r.clone()]).await?;
-            r
-        } else {
-            let r=text(conn,"SELECT id FROM requests WHERE cohort_id=?1 AND state='open' ORDER BY id LIMIT 1",params![cohort.clone()]).await?.ok_or_else(||error("empty open cohort"))?;
-            let card=get_conn(conn,&r).await?.ok_or_else(||error("missing request"))?;
-            if card.kind!=input.kind || card.target_identity!=input.target_identity {return Err(error("coalescing key collides with another kind or target identity"));}
-            r
-        };
-        let c=&input.contribution;
-        let requirements=encode(&c.requirements)?;
-        let normalized=encode(&c.normalized_target)?;
-        let filing_key=encode(&c.normalized_target.get("filing").cloned().unwrap_or_else(||json!({"requirements":c.requirements,"normalized_target":c.normalized_target})))?;
-        let duplicate=text(conn,"SELECT id FROM request_requesters WHERE request_id=?1 AND origin_uri=?2 AND rationale=?3 AND filing_key=?4",params![request.clone(),c.origin_uri.clone(),c.rationale.clone(),filing_key.clone()]).await?;
-        let contribution=duplicate.clone().unwrap_or_else(id);
-        let mut modified=duplicate.is_none();
-        if duplicate.is_none() {
-            conn.execute("INSERT INTO request_requesters(id,request_id,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,minimum_target,normalized_target_json,filing_key,active,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12)",
+    db.exclusive(move |conn| {
+        let input = input_owned.clone();
+        Box::pin(async move { file_conn(conn, &input, now).await })
+    })
+    .await
+}
+async fn file_conn(
+    conn: &TrackedConnection,
+    input: &NormalizedRequest,
+    now: i64,
+) -> DbResult<FiledOperatorRequest> {
+    let existing=text(conn,"SELECT id FROM request_cohorts WHERE workspace_id=?1 AND coalescing_key=?2 AND state='open'",params![input.workspace_id.clone(),input.coalescing_key.clone()]).await?;
+    let created = existing.is_none();
+    let cohort = existing.unwrap_or_else(id);
+    let request = if created {
+        let r = id();
+        conn.execute("INSERT INTO request_cohorts(id,workspace_id,coalescing_key,kind,state,created_at,updated_at) VALUES(?1,?2,?3,?4,'open',?5,?5)",params![cohort.clone(),input.workspace_id.clone(),input.coalescing_key.clone(),input.kind.as_str(),now]).await?;
+        conn.execute("INSERT INTO requests(id,workspace_id,kind,target,target_identity,coalescing_key,cohort_id,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'open',?8,?8)",params![r.clone(),input.workspace_id.clone(),input.kind.as_str(),input.target.clone(),input.target_identity.clone(),input.coalescing_key.clone(),cohort.clone(),now]).await?;
+        conn.execute(
+            "INSERT INTO request_cohort_members(cohort_id,request_id) VALUES(?1,?2)",
+            params![cohort.clone(), r.clone()],
+        )
+        .await?;
+        r
+    } else {
+        let r = text(
+            conn,
+            "SELECT id FROM requests WHERE cohort_id=?1 AND state='open' ORDER BY id LIMIT 1",
+            params![cohort.clone()],
+        )
+        .await?
+        .ok_or_else(|| error("empty open cohort"))?;
+        let card = get_conn(conn, &r)
+            .await?
+            .ok_or_else(|| error("missing request"))?;
+        if card.kind != input.kind || card.target_identity != input.target_identity {
+            return Err(error(
+                "coalescing key collides with another kind or target identity",
+            ));
+        }
+        r
+    };
+    let c = &input.contribution;
+    let requirements = encode(&c.requirements)?;
+    let normalized = encode(&c.normalized_target)?;
+    let filing_key = encode(&c.normalized_target.get("filing").cloned().unwrap_or_else(
+        || json!({"requirements":c.requirements,"normalized_target":c.normalized_target}),
+    ))?;
+    let duplicate=text(conn,"SELECT id FROM request_requesters WHERE request_id=?1 AND origin_uri=?2 AND rationale=?3 AND filing_key=?4",params![request.clone(),c.origin_uri.clone(),c.rationale.clone(),filing_key.clone()]).await?;
+    let contribution = duplicate.clone().unwrap_or_else(id);
+    let mut modified = duplicate.is_none();
+    if duplicate.is_none() {
+        conn.execute("INSERT INTO request_requesters(id,request_id,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,minimum_target,normalized_target_json,filing_key,active,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12)",
                 params![contribution.clone(),request.clone(),c.origin_uri.clone(),c.run_id.clone(),encode(&c.principal)?,c.wake_destination.clone(),c.rationale.clone(),requirements,c.minimum_target.clone(),normalized,filing_key,now]).await?;
-            enqueue(conn,&request,"reference",Some(&c.wake_destination),json!({"request_id":request,"request_uri":request_uri_conn(conn,&request).await?,"run_id":c.run_id,"origin_uri":c.origin_uri}),now).await?;
-        } else {
-            let active=text(conn,"SELECT CAST(active AS TEXT) FROM request_requesters WHERE id=?1",params![contribution.clone()]).await?;
-            if active.as_deref()==Some("0") {
-                conn.execute("UPDATE request_requesters SET active=1 WHERE id=?1",params![contribution.clone()]).await?;modified=true;
-            }
+        enqueue(conn,&request,"reference",Some(&c.wake_destination),json!({"request_id":request,"request_uri":request_uri_conn(conn,&request).await?,"run_id":c.run_id,"origin_uri":c.origin_uri}),now).await?;
+    } else {
+        let active = text(
+            conn,
+            "SELECT CAST(active AS TEXT) FROM request_requesters WHERE id=?1",
+            params![contribution.clone()],
+        )
+        .await?;
+        if active.as_deref() == Some("0") {
+            conn.execute(
+                "UPDATE request_requesters SET active=1 WHERE id=?1",
+                params![contribution.clone()],
+            )
+            .await?;
+            modified = true;
         }
-        for uri in &c.waiting {
-            let n=conn.execute("INSERT OR IGNORE INTO request_waiting(contribution_id,uri) VALUES(?1,?2)",params![contribution.clone(),uri.clone()]).await?;
-            modified|=n>0;
-        }
-        if modified { recompute(conn,&cohort,now).await?;changed(conn,&request,false,now).await?; }
-        Ok(FiledOperatorRequest{request:get_conn(conn,&request).await?.ok_or_else(||error("missing filed request"))?,created})
-    }) }).await
+    }
+    for uri in &c.waiting {
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO request_waiting(contribution_id,uri) VALUES(?1,?2)",
+                params![contribution.clone(), uri.clone()],
+            )
+            .await?;
+        modified |= n > 0;
+    }
+    if modified {
+        recompute(conn, &cohort, now).await?;
+        changed(conn, &request, false, now).await?;
+    }
+    Ok(FiledOperatorRequest {
+        request: get_conn(conn, &request)
+            .await?
+            .ok_or_else(|| error("missing filed request"))?,
+        created,
+    })
 }
 pub async fn withdraw_request(
     db: &LocalDb,
@@ -586,6 +615,20 @@ fn validate_acceptance(a: &RequestAcceptance) -> DbResult<()> {
     {
         return Err(error("missing or unsupported frozen acceptance fields"));
     }
+    if let Some(from) = &a.chained_from {
+        if !nonblank(&from.parent_attempt_id)
+            || !nonblank(&from.parent_authorization_event_id)
+            || from.parent_binding_digest.len() != 64
+            || !from
+                .parent_binding_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(error(
+                "a chained acceptance names its parent attempt, journal event and binding digest",
+            ));
+        }
+    }
     if (a.kind == RequestKind::FencedCommand) != a.fenced_command.is_some() {
         return Err(error(
             "a fenced_command acceptance, and only one, carries its frozen act",
@@ -636,19 +679,6 @@ fn validate_acceptance(a: &RequestAcceptance) -> DbResult<()> {
                 ));
             }
         }
-        RequestKind::BumpVersion => {
-            version(
-                a.target
-                    .as_deref()
-                    .ok_or_else(|| error("missing bump target"))?,
-            )?;
-            if a.base_commit.as_ref().is_none_or(|s| !nonblank(s))
-                || a.policy_project_id.as_ref().is_none_or(|s| !nonblank(s))
-                || a.drain.is_some()
-            {
-                return Err(error("bump acceptance requires base and policy project"));
-            }
-        }
         RequestKind::LiftDrain => {
             let d = a
                 .drain
@@ -673,32 +703,84 @@ pub async fn accept_request(db: &LocalDb, a: &RequestAcceptance) -> DbResult<Req
     let a_owned = a.clone();
 
     validate_acceptance(a)?;
-    db.exclusive(move |conn| { let a=a_owned.clone(); Box::pin(async move {let a=&a;
-        let first=a.request_ids.first().ok_or_else(||error("empty acceptance membership"))?;
-        let r=get_conn(conn,first).await?.ok_or_else(||error("request not found"))?;
-        let mut expected=a.request_ids.clone();expected.sort();expected.dedup();
-        if expected.len()!=a.request_ids.len()||r.member_request_ids!=expected||r.state!=RequestState::Open
-            ||r.cohort_id!=a.cohort_id||r.revision!=a.revision||r.kind!=a.kind||r.target!=a.target
-            ||r.target_identity!=a.target_identity||r.workspace_id!=a.workspace_id {
-            return Err(error("stale or mismatched acceptance membership, kind, target or revision"));
+    if a.chained_from.is_some() {
+        return Err(error(
+            "a chained acceptance is written only from its parent's verified report",
+        ));
+    }
+    db.exclusive(move |conn| {
+        let a = a_owned.clone();
+        Box::pin(async move { accept_conn(conn, &a).await })
+    })
+    .await
+}
+/// The acceptance write an operator's decision and a chain share: membership,
+/// revision and facts pinned to the card, the journal event, the attempt, its
+/// members and the dispatch intent, in the caller's transaction.
+async fn accept_conn(conn: &TrackedConnection, a: &RequestAcceptance) -> DbResult<RequestAttempt> {
+    let first = a
+        .request_ids
+        .first()
+        .ok_or_else(|| error("empty acceptance membership"))?;
+    let r = get_conn(conn, first)
+        .await?
+        .ok_or_else(|| error("request not found"))?;
+    let mut expected = a.request_ids.clone();
+    expected.sort();
+    expected.dedup();
+    if expected.len() != a.request_ids.len()
+        || r.member_request_ids != expected
+        || r.state != RequestState::Open
+        || r.cohort_id != a.cohort_id
+        || r.revision != a.revision
+        || r.kind != a.kind
+        || r.target != a.target
+        || r.target_identity != a.target_identity
+        || r.workspace_id != a.workspace_id
+    {
+        return Err(error(
+            "stale or mismatched acceptance membership, kind, target or revision",
+        ));
+    }
+    let f = r.facts.as_ref().ok_or_else(|| error("facts unavailable"))?;
+    if f.version != a.facts_version || f.revision != a.revision {
+        return Err(error("stale displayed facts"));
+    }
+    let unresolved=text(conn,"SELECT a.id FROM request_attempts a JOIN request_cohorts c ON c.id=a.cohort_id WHERE (a.state IN ('accepted','acting') OR (a.state='failed' AND a.settled=0)) AND c.workspace_id=?1 AND (c.coalescing_key=?2 OR c.id=?3) LIMIT 1",params![a.workspace_id.clone(),r.coalescing_key.clone(),a.cohort_id.clone()]).await?;
+    if unresolved.is_some() {
+        return Err(error("an earlier accepted consumer is unresolved; reconcile/fence it before another acceptance"));
+    }
+    let event = authority::append_request_acceptance_conn(conn, a).await?;
+    conn.execute("INSERT INTO request_attempts(id,cohort_id,authorization_event_id,acceptance_json,state,updated_at) VALUES(?1,?2,?3,?4,'accepted',?5)",params![a.attempt_id.clone(),a.cohort_id.clone(),event.clone(),encode(a)?,a.accepted_at]).await?;
+    for m in &a.request_ids {
+        let snapshot = contributions(conn, m).await?;
+        if !snapshot
+            .iter()
+            .any(|c| c.active && c.satisfied_by_attempt.is_none())
+        {
+            return Err(error("acceptance includes a closed member"));
         }
-        let f=r.facts.as_ref().ok_or_else(||error("facts unavailable"))?;
-        if f.version!=a.facts_version||f.revision!=a.revision {return Err(error("stale displayed facts"));}
-        let unresolved=text(conn,"SELECT a.id FROM request_attempts a JOIN request_cohorts c ON c.id=a.cohort_id WHERE (a.state IN ('accepted','acting') OR (a.state='failed' AND a.settled=0)) AND c.workspace_id=?1 AND (c.coalescing_key=?2 OR c.id=?3) LIMIT 1",params![a.workspace_id.clone(),r.coalescing_key.clone(),a.cohort_id.clone()]).await?;
-        if unresolved.is_some() {return Err(error("an earlier accepted consumer is unresolved; reconcile/fence it before another acceptance"));}
-        let event=authority::append_request_acceptance_conn(conn,a).await?;
-        conn.execute("INSERT INTO request_attempts(id,cohort_id,authorization_event_id,acceptance_json,state,updated_at) VALUES(?1,?2,?3,?4,'accepted',?5)",params![a.attempt_id.clone(),a.cohort_id.clone(),event.clone(),encode(a)?,a.accepted_at]).await?;
-        for m in &a.request_ids {
-            let snapshot=contributions(conn,m).await?;
-            if !snapshot.iter().any(|c|c.active&&c.satisfied_by_attempt.is_none()) {return Err(error("acceptance includes a closed member"));}
-            conn.execute("INSERT INTO request_attempt_members(attempt_id,request_id,contributions_json) VALUES(?1,?2,?3)",params![a.attempt_id.clone(),m.clone(),encode(&snapshot)?]).await?;
-            conn.execute("UPDATE requests SET state='accepted',current_attempt=?2,updated_at=?3 WHERE id=?1 AND state='open'",params![m.clone(),a.attempt_id.clone(),a.accepted_at]).await?;
-        }
-        conn.execute("UPDATE request_cohorts SET state='accepted',updated_at=?2 WHERE id=?1",params![a.cohort_id.clone(),a.accepted_at]).await?;
-        enqueue(conn,first,"dispatch",None,json!({"attempt_id":a.attempt_id,"authorization_event_id":event}),a.accepted_at).await?;
-        changed_many(conn,&a.request_ids,true,a.accepted_at).await?;
-        attempt_conn(conn,&event).await?.ok_or_else(||error("attempt missing"))
-    }) }).await
+        conn.execute("INSERT INTO request_attempt_members(attempt_id,request_id,contributions_json) VALUES(?1,?2,?3)",params![a.attempt_id.clone(),m.clone(),encode(&snapshot)?]).await?;
+        conn.execute("UPDATE requests SET state='accepted',current_attempt=?2,updated_at=?3 WHERE id=?1 AND state='open'",params![m.clone(),a.attempt_id.clone(),a.accepted_at]).await?;
+    }
+    conn.execute(
+        "UPDATE request_cohorts SET state='accepted',updated_at=?2 WHERE id=?1",
+        params![a.cohort_id.clone(), a.accepted_at],
+    )
+    .await?;
+    enqueue(
+        conn,
+        first,
+        "dispatch",
+        None,
+        json!({"attempt_id":a.attempt_id,"authorization_event_id":event}),
+        a.accepted_at,
+    )
+    .await?;
+    changed_many(conn, &a.request_ids, true, a.accepted_at).await?;
+    attempt_conn(conn, &event)
+        .await?
+        .ok_or_else(|| error("attempt missing"))
 }
 pub async fn decline_request(
     db: &LocalDb,
@@ -782,7 +864,7 @@ async fn checked_record(
                 },
                 cairn_common::authorization::AuthorityAction::Run,
             )
-        || row.text(8)? != "operator_request_acceptance"
+        || row.text(8)? != authority::acceptance_reason(expected)
         || decode::<cairn_common::authorization::AuthorityPrincipal>(&row.text(9)?)?
             != (cairn_common::authorization::AuthorityPrincipal {
                 actor: Some(expected.operator.clone()),
@@ -796,6 +878,22 @@ async fn checked_record(
         return Err(error("acceptance journal provenance mismatch"));
     }
     drop(rows);
+    // A chained acceptance's authority is its parent, so the parent is proven
+    // again on every checked read: claim, recheck, report and recovery alike.
+    if let Some(from) = &expected.chained_from {
+        parent_provenance(conn, expected, from).await?;
+        let chain = chain_conn(conn, &from.parent_attempt_id).await?;
+        if chain.as_ref().is_none_or(|chain| {
+            chain.state != ChainState::Accepted
+                || chain.child_attempt_id.as_deref() != Some(expected.attempt_id.as_str())
+                || chain.kind != expected.kind
+                || expected.candidate_commit.as_deref() != Some(chain.commit.as_str())
+        }) {
+            return Err(error(
+                "chained acceptance refused: its chain row does not name this child attempt",
+            ));
+        }
+    }
     let mut ids = vec![];
     let mut rows=conn.query("SELECT m.request_id,r.current_attempt,r.state FROM request_attempt_members m JOIN requests r ON r.id=m.request_id WHERE m.attempt_id=?1 ORDER BY m.request_id",params![a.id.clone()]).await?;
     while let Some(r) = rows.next().await? {
@@ -912,50 +1010,23 @@ pub async fn report_request(
     settled: bool,
     now: i64,
 ) -> DbResult<RequestAttempt> {
-    report_request_with_fulfillment(
-        db,
-        attempt,
-        claim,
-        receipt,
-        outcome,
-        report,
-        settled,
-        &[],
-        now,
-    )
-    .await
-}
-#[allow(clippy::too_many_arguments)]
-pub async fn report_request_with_fulfillment(
-    db: &LocalDb,
-    attempt: &str,
-    claim: &str,
-    receipt: &str,
-    outcome: RequestAttemptOutcome,
-    report: Value,
-    settled: bool,
-    covered: &[String],
-    now: i64,
-) -> DbResult<RequestAttempt> {
     let attempt_owned = attempt.to_string();
     let claim_owned = claim.to_string();
     let receipt_owned = receipt.to_string();
-    let covered_owned = covered.to_vec();
 
     if !nonblank(receipt) {
         return Err(error("consumer report requires stable receipt id"));
     }
-    let wire =
-        encode(&json!({"outcome":outcome,"report":report,"settled":settled,"covered":covered}))?;
+    let wire = encode(&json!({"outcome":outcome,"report":report,"settled":settled}))?;
     db.exclusive(move |conn| {
         let wire=wire.clone();let outcome=outcome.clone();let report=report.clone();
-        let attempt=attempt_owned.clone(); let claim=claim_owned.clone(); let receipt=receipt_owned.clone(); let covered=covered_owned.clone(); Box::pin(async move {let attempt=attempt.as_str(); let claim=claim.as_str(); let receipt=receipt.as_str(); let covered=covered.as_slice();
+        let attempt=attempt_owned.clone(); let claim=claim_owned.clone(); let receipt=receipt_owned.clone(); Box::pin(async move {let attempt=attempt.as_str(); let claim=claim.as_str(); let receipt=receipt.as_str();
             let event=text(conn,"SELECT authorization_event_id FROM request_attempts WHERE id=?1",params![attempt]).await?.ok_or_else(||error("unknown attempt"))?;
             let a=attempt_conn(conn,&event).await?.ok_or_else(||error("missing attempt"))?;
             let mut rows=conn.query("SELECT attempt_id,claim_id,report_json FROM request_report_receipts WHERE id=?1",params![receipt]).await?;
             if let Some(r)=rows.next().await? {
                 if r.text(0)?!=attempt||r.text(1)?!=claim {return Err(error("conflicting consumer receipt attribution"));}
-                frozen_report_coverage(&r.text(2)?, &outcome, &report, settled)?;
+                frozen_receipt_matches(&r.text(2)?, &outcome, &report, settled)?;
                 return Ok(a);
             }
             drop(rows);
@@ -978,130 +1049,16 @@ pub async fn report_request_with_fulfillment(
             }
             if settled&&outcome!=RequestAttemptOutcome::Done {reopen(conn,&a,now).await?;}
             else {conn.execute("UPDATE request_cohorts SET state=?2,updated_at=?3 WHERE id=?1",params![a.acceptance.cohort_id.clone(),state,now]).await?;}
-            let mut changed_requests=a.acceptance.request_ids.clone();
-            if !covered.is_empty() {
-                changed_requests.extend(fulfill_conn(conn,attempt,covered,&report,now).await?);
-            }
-            if settled && outcome!=RequestAttemptOutcome::Done && a.acceptance.kind==RequestKind::BumpVersion {
-                let mut rows=conn.query("SELECT id FROM requests WHERE workspace_id=?1 AND kind='rebuild' AND state='open'",params![a.acceptance.workspace_id.clone()]).await?;
-                let mut ids=vec![];while let Some(r)=rows.next().await? {ids.push(r.text(0)?);}drop(rows);
-                for r in ids {
-                    conn.execute("UPDATE requests SET report_json=?2,updated_at=?3 WHERE id=?1",params![r.clone(),encode(&json!({"bump_failure_attempt":attempt,"report":report}))?,now]).await?;
-                    changed_requests.push(r);
-                }
-            }
-            changed_many(conn,&changed_requests,true,now).await?;
+            if outcome==RequestAttemptOutcome::Done {record_chain(conn,&a,&report,now).await?;}
+            if settled {wake_pending_chains(conn,a.acceptance.kind,now).await?;}
+            changed_many(conn,&a.acceptance.request_ids,true,now).await?;
             attempt_conn(conn,&event).await?.ok_or_else(||error("missing attempt"))
         })
     }).await
 }
-/// Links proven coverage, never inventing acceptance on the fulfilled request.
-pub async fn fulfill_rebuild_contributions(
-    db: &LocalDb,
-    bump_attempt: &str,
-    covered: &[String],
-    report: Value,
-    now: i64,
-) -> DbResult<()> {
-    let bump_attempt_owned = bump_attempt.to_string();
-    let covered_owned = covered.to_vec();
-
-    db.exclusive(move |conn| {
-        let report = report.clone();
-        let bump_attempt = bump_attempt_owned.clone();
-        let covered = covered_owned.clone();
-        Box::pin(async move {
-            let bump_attempt = bump_attempt.as_str();
-            let covered = covered.as_slice();
-            let requests = fulfill_conn(conn, bump_attempt, covered, &report, now).await?;
-            changed_many(conn, &requests, true, now).await
-        })
-    })
-    .await
-}
-async fn fulfill_conn(
-    conn: &TrackedConnection,
-    bump_attempt: &str,
-    covered: &[String],
-    report: &Value,
-    now: i64,
-) -> DbResult<Vec<String>> {
-    let event = text(
-        conn,
-        "SELECT authorization_event_id FROM request_attempts WHERE id=?1",
-        params![bump_attempt],
-    )
-    .await?
-    .ok_or_else(|| error("unknown bump attempt"))?;
-    let a = attempt_conn(conn, &event)
-        .await?
-        .ok_or_else(|| error("missing bump attempt"))?;
-    if a.acceptance.kind != RequestKind::BumpVersion
-        || a.state != RequestState::Done
-        || a.outcome != Some(RequestAttemptOutcome::Done)
-    {
-        return Err(error(
-            "linked rebuild fulfillment requires successful checked bump",
-        ));
-    }
-    let mut satisfied: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    for c in covered {
-        let mut rows=conn.query("SELECT x.request_id,r.kind,r.state,x.satisfied_by_attempt FROM request_requesters x JOIN requests r ON r.id=x.request_id WHERE x.id=?1 AND x.active=1",params![c.clone()]).await?;
-        let r = rows
-            .next()
-            .await?
-            .ok_or_else(|| error("covered contribution is unknown/inactive"))?;
-        let request = r.text(0)?;
-        if r.text(1)? != "rebuild" {
-            return Err(error("bump may fulfill rebuild contributions only"));
-        }
-        if r.opt_text(3)?.as_deref() == Some(bump_attempt) {
-            continue;
-        }
-        if r.text(2)? != "open" || r.opt_text(3)?.is_some() {
-            return Err(error("covered rebuild contribution is not open"));
-        }
-        drop(rows);
-        satisfied.entry(request).or_default().insert(c.clone());
-    }
-    for (request, contributions) in &satisfied {
-        let contributions: Vec<_> = contributions.iter().cloned().collect();
-        record_fulfillment(conn, bump_attempt, request, &contributions).await?;
-    }
-    let requests: Vec<_> = satisfied.into_keys().collect();
-    for request in &requests {
-        let r = get_conn(conn, request)
-            .await?
-            .ok_or_else(|| error("missing rebuild"))?;
-        let remaining=text(conn,"SELECT id FROM request_requesters WHERE request_id=?1 AND active=1 AND satisfied_by_attempt IS NULL LIMIT 1",params![request.clone()]).await?;
-        conn.execute("UPDATE requests SET report_json=?2,updated_at=?3,state=?4 WHERE id=?1",params![request.clone(),encode(&json!({"fulfilled_by_attempt":bump_attempt,"authorization_event_id":event,"report":report}))?,now,if remaining.is_none(){"done"}else{"open"}]).await?;
-        conn.execute(
-            "UPDATE request_cohorts SET revision=revision+1,updated_at=?2 WHERE id=?1",
-            params![r.cohort_id.clone(), now],
-        )
-        .await?;
-        let open = text(
-            conn,
-            "SELECT id FROM requests WHERE cohort_id=?1 AND state='open' LIMIT 1",
-            params![r.cohort_id.clone()],
-        )
-        .await?;
-        if open.is_none() {
-            conn.execute(
-                "UPDATE request_cohorts SET state='done' WHERE id=?1",
-                params![r.cohort_id],
-            )
-            .await?;
-        }
-    }
-    Ok(requests)
-}
 /// Records `attempt` as what satisfied `contributions` of `request` and what
-/// fulfilled the request. Both finishing paths (a request's own accepted
-/// attempt, and a bump attempt's proven coverage) write through here, so
-/// `recompute` reads a finished request's contributions as satisfied rather
-/// than open.
+/// fulfilled the request, so `recompute` reads a finished request's
+/// contributions as satisfied rather than open.
 async fn record_fulfillment(
     conn: &TrackedConnection,
     attempt: &str,
@@ -1202,6 +1159,7 @@ pub async fn fail_unclaimed_request(
                 conn.execute("UPDATE requests SET report_json=?2,updated_at=?3 WHERE id=?1",params![m.clone(),encode(&report)?,now]).await?;
             }
             reopen(conn,&a,now).await?;
+            wake_pending_chains(conn,a.acceptance.kind,now).await?;
             changed_many(conn,&a.acceptance.request_ids,true,now).await?;
             attempt_conn(conn,event).await?.ok_or_else(||error("attempt missing"))
         })
@@ -1273,75 +1231,658 @@ pub async fn dispatch_disposition(db: &LocalDb, event: &str) -> DbResult<Dispatc
     .await
 }
 
+/// A request attempt by its id.
+pub async fn get_attempt(db: &LocalDb, attempt: &str) -> DbResult<Option<RequestAttempt>> {
+    let attempt = attempt.to_string();
+    db.read(move |conn| {
+        let attempt = attempt.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    format!("SELECT {ATTEMPT_COLUMNS} FROM request_attempts a WHERE a.id=?1"),
+                    params![attempt],
+                )
+                .await?;
+            rows.next().await?.as_ref().map(attempt_row).transpose()
+        })
+    })
+    .await
+}
+
+/// Whether any attempt of `kind` is accepted, acting, or failed without
+/// settlement: an actor that may still be running.
+pub async fn kind_has_unresolved_attempt(db: &LocalDb, kind: RequestKind) -> DbResult<bool> {
+    let kind = kind.as_str().to_string();
+    db.read(move |conn| {
+        let kind = kind.clone();
+        Box::pin(async move {
+            Ok(text(
+                conn,
+                "SELECT id FROM request_attempts WHERE (state IN ('accepted','acting') OR (state='failed' AND settled=0)) AND json_extract(acceptance_json,'$.kind')=?1 LIMIT 1",
+                params![kind],
+            )
+            .await?
+            .is_some())
+        })
+    })
+    .await
+}
+
+/// The settled `Done` attempts of `kind` whose report was stored at or after
+/// `since`, newest first, each with the commit its report names as built.
+pub async fn done_attempts_since(
+    db: &LocalDb,
+    kind: RequestKind,
+    since: i64,
+) -> DbResult<Vec<(String, String)>> {
+    let kind = kind.as_str().to_string();
+    db.read(move |conn| {
+        let kind = kind.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id,report_json FROM request_attempts WHERE json_extract(acceptance_json,'$.kind')=?1 AND state='done' AND outcome='done' AND settled=1 AND updated_at>=?2 ORDER BY updated_at DESC,id LIMIT 8",
+                    params![kind, since],
+                )
+                .await?;
+            let mut out = vec![];
+            while let Some(r) = rows.next().await? {
+                let report: Option<Value> = r.opt_text(1)?.map(|s| decode(&s)).transpose()?;
+                if let Some(built) = report
+                    .as_ref()
+                    .and_then(|report| report.get("builtCommit"))
+                    .and_then(Value::as_str)
+                {
+                    out.push((r.text(0)?, built.to_string()));
+                }
+            }
+            Ok(out)
+        })
+    })
+    .await
+}
+
+/// How long after a parent's verified `Done` report its chain may still write
+/// the chained acceptance. Past it, the chained request is an ordinary card.
+pub const CHAIN_WINDOW_MS: i64 = 30 * 60 * 1000;
+
+pub use cairn_common::requests::ChainState;
+
+/// One parent attempt's chain into the request its bound act names as `then`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestChain {
+    pub parent_attempt_id: String,
+    pub kind: RequestKind,
+    /// The commit the parent's verified report landed.
+    pub commit: String,
+    pub deadline_unix_ms: i64,
+    pub state: ChainState,
+    pub child_request_id: Option<String>,
+    pub child_attempt_id: Option<String>,
+    pub refusal: Option<String>,
+    /// The parent requesters' wake destinations, one chained contribution each.
+    pub wake_destinations: Vec<String>,
+    pub created_at: i64,
+}
+
+/// How a pending chain ends without a chained acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainSettlement {
+    Refused(String),
+    /// An attempt of the chained kind, already acting when the chain was
+    /// written, finished `Done` on a commit containing the chain's.
+    Satisfied {
+        attempt_id: String,
+    },
+}
+
+const CHAIN_COLUMNS: &str = "parent_attempt_id,kind,commit_id,deadline_unix_ms,state,child_request_id,child_attempt_id,refusal,wake_destinations_json,created_at";
+
+fn chain_row(r: &crate::turso::Row) -> DbResult<RequestChain> {
+    Ok(RequestChain {
+        parent_attempt_id: r.text(0)?,
+        kind: word(&r.text(1)?)?,
+        commit: r.text(2)?,
+        deadline_unix_ms: r.i64(3)?,
+        state: word(&r.text(4)?)?,
+        child_request_id: r.opt_text(5)?,
+        child_attempt_id: r.opt_text(6)?,
+        refusal: r.opt_text(7)?,
+        wake_destinations: decode(&r.text(8)?)?,
+        created_at: r.i64(9)?,
+    })
+}
+
+async fn chain_conn(conn: &TrackedConnection, parent: &str) -> DbResult<Option<RequestChain>> {
+    let mut rows = conn
+        .query(
+            format!("SELECT {CHAIN_COLUMNS} FROM request_chains WHERE parent_attempt_id=?1"),
+            params![parent],
+        )
+        .await?;
+    rows.next().await?.as_ref().map(chain_row).transpose()
+}
+
+pub async fn get_chain(db: &LocalDb, parent: &str) -> DbResult<Option<RequestChain>> {
+    let parent = parent.to_string();
+    db.read(move |conn| {
+        let parent = parent.clone();
+        Box::pin(async move { chain_conn(conn, &parent).await })
+    })
+    .await
+}
+
+/// The kind an acceptance's bound act chains into, when it names one.
+fn chained_kind(a: &RequestAcceptance) -> Option<RequestKind> {
+    if a.kind != RequestKind::FencedCommand {
+        return None;
+    }
+    a.fenced_command.as_ref()?.act.declaration.as_ref()?.then
+}
+
+/// The commit an attempt's settled `Done` receipt names as built.
+async fn receipt_commit(conn: &TrackedConnection, attempt: &str) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT report_json FROM request_report_receipts WHERE attempt_id=?1 ORDER BY created_at,id",
+            params![attempt],
+        )
+        .await?;
+    while let Some(r) = rows.next().await? {
+        // A pre-dispatch refusal stores its bare report, not this wire; it is
+        // never a success, so it is skipped rather than read.
+        let Ok(wire) = serde_json::from_str::<ReportReceiptWire>(&r.text(0)?) else {
+            continue;
+        };
+        if wire.outcome == RequestAttemptOutcome::Done && wire.settled {
+            return Ok(wire
+                .report
+                .get("builtCommit")
+                .and_then(Value::as_str)
+                .map(str::to_owned));
+        }
+    }
+    Ok(None)
+}
+
+/// Everything a chained acceptance's authority rests on that its parent
+/// holds: the parent's operator journal event and frozen binding, a bound act
+/// naming this kind as `then`, a policy covering this kind's, the same
+/// operator attribution, and a settled `Done` receipt naming the candidate.
+async fn parent_provenance(
+    conn: &TrackedConnection,
+    a: &RequestAcceptance,
+    from: &ChainedFrom,
+) -> DbResult<()> {
+    let refuse = |why: &str| error(format!("chained acceptance refused: {why}"));
+    let mut rows = conn
+        .query(
+            "SELECT outcome,reason,request_acceptance_json FROM authorization_events WHERE id=?1",
+            params![from.parent_authorization_event_id.clone()],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Err(refuse("the parent acceptance's journal event is missing"));
+    };
+    if row.text(0)? != "request_accepted" || row.text(1)? != authority::REQUEST_ACCEPTANCE_REASON {
+        return Err(refuse(
+            "the parent journal event is not an operator acceptance",
+        ));
+    }
+    let parent: RequestAcceptance = decode(
+        &row.opt_text(2)?
+            .ok_or_else(|| refuse("the parent journal event froze no acceptance"))?,
+    )?;
+    drop(rows);
+    if parent.attempt_id != from.parent_attempt_id {
+        return Err(refuse("the parent journal event accepted another attempt"));
+    }
+    if parent.binding.digest != from.parent_binding_digest {
+        return Err(refuse("the parent's binding digest differs"));
+    }
+    if chained_kind(&parent) != Some(a.kind) {
+        return Err(refuse(&format!(
+            "the parent's bound act does not name {} as its then",
+            a.kind.as_str()
+        )));
+    }
+    if !parent
+        .kind
+        .acceptance_policy()
+        .covers(a.kind.acceptance_policy())
+    {
+        return Err(refuse(
+            "this kind's acceptance policy is stronger than its parent's",
+        ));
+    }
+    if parent.operator != a.operator
+        || parent.appearance != a.appearance
+        || parent.install_id != a.install_id
+        || parent.workspace_id != a.workspace_id
+    {
+        return Err(refuse("its operator attribution differs from the parent's"));
+    }
+    let attempt = attempt_conn(conn, &from.parent_authorization_event_id)
+        .await?
+        .ok_or_else(|| refuse("the parent attempt is missing"))?;
+    if attempt.id != from.parent_attempt_id
+        || attempt.state != RequestState::Done
+        || attempt.outcome != Some(RequestAttemptOutcome::Done)
+    {
+        return Err(refuse("the parent attempt is not done"));
+    }
+    if receipt_commit(conn, &attempt.id).await?.as_deref() != a.candidate_commit.as_deref() {
+        return Err(refuse(
+            "the parent's receipt does not name the candidate commit",
+        ));
+    }
+    Ok(())
+}
+
+/// A parent act whose bound declaration names `then` yields its chain here,
+/// inside the transaction that stores its verified `Done` report. The table
+/// holds one row per parent attempt and one per (kind, commit), so a second
+/// `Done` on a commit that already chained writes nothing: the retry of a
+/// chain is its ordinary card, never a second chain.
+async fn record_chain(
+    conn: &TrackedConnection,
+    a: &RequestAttempt,
+    report: &Value,
+    now: i64,
+) -> DbResult<()> {
+    let Some(kind) = chained_kind(&a.acceptance) else {
+        return Ok(());
+    };
+    let Some(commit) = report
+        .get("builtCommit")
+        .and_then(Value::as_str)
+        .filter(|commit| nonblank(commit))
+    else {
+        return Ok(());
+    };
+    let mut destinations = std::collections::BTreeSet::new();
+    for m in &a.acceptance.request_ids {
+        for c in contributions(conn, m).await? {
+            destinations.insert(c.wake_destination);
+        }
+    }
+    let destinations: Vec<String> = destinations.into_iter().collect();
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO request_chains(parent_attempt_id,kind,commit_id,deadline_unix_ms,state,wake_destinations_json,created_at,updated_at) VALUES(?1,?2,?3,?4,'pending',?5,?6,?6)",
+            params![
+                a.id.clone(),
+                kind.as_str(),
+                commit,
+                now.saturating_mul(1000).saturating_add(CHAIN_WINDOW_MS),
+                encode(&destinations)?,
+                now
+            ],
+        )
+        .await?;
+    if inserted > 0 {
+        enqueue(
+            conn,
+            &a.acceptance.request_ids[0],
+            "chain",
+            None,
+            json!({"parent_attempt_id":a.id}),
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A settled attempt of a kind a pending chain names may have built that
+/// chain's commit, or freed the kind for the chained acceptance: wake each.
+async fn wake_pending_chains(
+    conn: &TrackedConnection,
+    kind: RequestKind,
+    now: i64,
+) -> DbResult<()> {
+    let mut rows = conn
+        .query(
+            "SELECT c.parent_attempt_id,(SELECT MIN(m.request_id) FROM request_attempt_members m WHERE m.attempt_id=c.parent_attempt_id) FROM request_chains c WHERE c.state='pending' AND c.kind=?1 ORDER BY c.parent_attempt_id",
+            params![kind.as_str()],
+        )
+        .await?;
+    let mut pending = vec![];
+    while let Some(r) = rows.next().await? {
+        pending.push((r.text(0)?, r.text(1)?));
+    }
+    drop(rows);
+    for (parent, request) in pending {
+        enqueue(
+            conn,
+            &request,
+            "chain",
+            None,
+            json!({"parent_attempt_id":parent}),
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Wakes each pending chain whose window has closed and that has no chain
+/// intent awaiting delivery. A chain waiting on an attempt that never settles
+/// has no other wake, and its refusal is what hands the card back to the
+/// operator. Returns how many chains were woken.
+pub async fn wake_expired_chains(db: &LocalDb, now_ms: i64, now: i64) -> DbResult<usize> {
+    db.write(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT c.parent_attempt_id,(SELECT MIN(m.request_id) FROM request_attempt_members m WHERE m.attempt_id=c.parent_attempt_id) FROM request_chains c WHERE c.state='pending' AND c.deadline_unix_ms<=?1 AND NOT EXISTS(SELECT 1 FROM request_outbox o WHERE o.kind='chain' AND o.delivered_at IS NULL AND json_extract(o.payload_json,'$.parent_attempt_id')=c.parent_attempt_id) ORDER BY c.parent_attempt_id LIMIT 64",
+                    params![now_ms],
+                )
+                .await?;
+            let mut due = vec![];
+            while let Some(r) = rows.next().await? {
+                due.push((r.text(0)?, r.text(1)?));
+            }
+            drop(rows);
+            for (parent, request) in &due {
+                enqueue(
+                    conn,
+                    request,
+                    "chain",
+                    None,
+                    json!({"parent_attempt_id":parent}),
+                    now,
+                )
+                .await?;
+            }
+            Ok(due.len())
+        })
+    })
+    .await
+}
+
+/// Files a pending chain's request once. Each wake destination among the
+/// parent's requesters gets one contribution requiring exactly the chain's
+/// commit, under the one origin only this primitive writes: the parent
+/// request's own address. The child request is recorded on the chain row in
+/// the same transaction, so a replay after a crash returns it and files
+/// nothing more. `input` supplies the kind's identity, coalescing key and
+/// rationale; the store sets everything the chain row and the parent decide.
+pub async fn file_chained_request(
+    db: &LocalDb,
+    parent: &str,
+    input: &NormalizedRequest,
+    now: i64,
+) -> DbResult<String> {
+    let parent = parent.to_string();
+    let input = input.clone();
+    db.exclusive(move |conn| {
+        let (parent, input) = (parent.clone(), input.clone());
+        Box::pin(async move {
+            let chain = chain_conn(conn, &parent)
+                .await?
+                .ok_or_else(|| error("no chain exists for this attempt"))?;
+            if let Some(child) = chain.child_request_id {
+                return Ok(child);
+            }
+            if chain.state != ChainState::Pending {
+                return Err(error("a settled chain files nothing"));
+            }
+            if input.kind != chain.kind {
+                return Err(error("the chained filing names another kind than its chain"));
+            }
+            let event = text(
+                conn,
+                "SELECT authorization_event_id FROM request_attempts WHERE id=?1",
+                params![parent.clone()],
+            )
+            .await?
+            .ok_or_else(|| error("the chain's parent attempt is missing"))?;
+            let attempt = attempt_conn(conn, &event)
+                .await?
+                .ok_or_else(|| error("the chain's parent attempt is missing"))?;
+            let origin = request_uri_conn(conn, &attempt.acceptance.request_ids[0]).await?;
+            let mut askers = vec![];
+            for m in &attempt.acceptance.request_ids {
+                askers.extend(contributions(conn, m).await?);
+            }
+            let mut child: Option<String> = None;
+            for destination in &chain.wake_destinations {
+                let asker = askers
+                    .iter()
+                    .find(|c| &c.wake_destination == destination)
+                    .ok_or_else(|| error("a chain destination names no parent requester"))?;
+                let mut filing = input.clone();
+                let c = &mut filing.contribution;
+                c.origin_uri = origin.clone();
+                c.wake_destination = destination.clone();
+                c.run_id = asker.run_id.clone();
+                c.principal = asker.principal.clone();
+                c.waiting = vec![];
+                c.requirements = RequestRequirements {
+                    commits: vec![chain.commit.clone()],
+                };
+                c.minimum_target = None;
+                c.normalized_target = json!({
+                    "commits":[chain.commit],
+                    "filing":{"chainedFrom":parent,"commits":[chain.commit],"wakeDestination":destination},
+                });
+                c.active = true;
+                c.satisfied_by_attempt = None;
+                if !nonblank(&filing.workspace_id)
+                    || !nonblank(&filing.target_identity)
+                    || !nonblank(&c.run_id)
+                    || !nonblank(&c.rationale)
+                {
+                    return Err(error(
+                        "a chained filing requires normalized identity and its parent's attribution",
+                    ));
+                }
+                let filed = file_conn(conn, &filing, now).await?;
+                if child.as_ref().is_some_and(|id| *id != filed.request.id) {
+                    return Err(error("chained contributions split across requests"));
+                }
+                child = Some(filed.request.id);
+            }
+            let child = child.ok_or_else(|| error("the parent has no requester to chain for"))?;
+            conn.execute(
+                "UPDATE request_chains SET child_request_id=?2,updated_at=?3 WHERE parent_attempt_id=?1 AND child_request_id IS NULL",
+                params![parent, child.clone(), now],
+            )
+            .await?;
+            Ok(child)
+        })
+    })
+    .await
+}
+
+/// Ends a pending chain without a chained acceptance, and wakes whoever its
+/// end concerns: the chained request's askers, or the parent's when nothing
+/// was filed. A satisfied chain marks its own contributions satisfied by the
+/// attempt that built the commit, so its card closes rather than asking again.
+pub async fn settle_chain(
+    db: &LocalDb,
+    parent: &str,
+    settlement: ChainSettlement,
+    now: i64,
+) -> DbResult<RequestChain> {
+    let parent = parent.to_string();
+    db.exclusive(move |conn| {
+        let (parent, settlement) = (parent.clone(), settlement.clone());
+        Box::pin(async move {
+            let chain = chain_conn(conn, &parent)
+                .await?
+                .ok_or_else(|| error("no chain exists for this attempt"))?;
+            if chain.state != ChainState::Pending {
+                return Err(error("the chain is already settled"));
+            }
+            let parent_request = text(
+                conn,
+                "SELECT MIN(request_id) FROM request_attempt_members WHERE attempt_id=?1",
+                params![parent.clone()],
+            )
+            .await?
+            .ok_or_else(|| error("the chain's parent attempt has no members"))?;
+            match settlement {
+                ChainSettlement::Refused(reason) => {
+                    if !nonblank(&reason) {
+                        return Err(error("a refused chain names its reason"));
+                    }
+                    conn.execute(
+                        "UPDATE request_chains SET state='refused',refusal=?2,updated_at=?3 WHERE parent_attempt_id=?1 AND state='pending'",
+                        params![parent.clone(), reason, now],
+                    )
+                    .await?;
+                }
+                ChainSettlement::Satisfied { attempt_id } => {
+                    let by = text(
+                        conn,
+                        "SELECT authorization_event_id FROM request_attempts WHERE id=?1 AND state='done' AND outcome='done' AND settled=1",
+                        params![attempt_id.clone()],
+                    )
+                    .await?
+                    .ok_or_else(|| error("a chain is satisfied only by a settled done attempt"))?;
+                    let by = attempt_conn(conn, &by)
+                        .await?
+                        .ok_or_else(|| error("the satisfying attempt is missing"))?;
+                    if by.acceptance.kind != chain.kind {
+                        return Err(error("the satisfying attempt is another kind than the chain's"));
+                    }
+                    if let Some(child) = &chain.child_request_id {
+                        let origin = request_uri_conn(conn, &parent_request).await?;
+                        let open: Vec<RequestContribution> = contributions(conn, child)
+                            .await?
+                            .into_iter()
+                            .filter(|c| c.active && c.satisfied_by_attempt.is_none())
+                            .collect();
+                        let ours: Vec<String> = open
+                            .iter()
+                            .filter(|c| c.origin_uri == origin)
+                            .map(|c| c.id.clone())
+                            .collect();
+                        if ours.len() == open.len() {
+                            record_fulfillment(conn, &attempt_id, child, &ours).await?;
+                        } else {
+                            for id in &ours {
+                                conn.execute(
+                                    "UPDATE request_requesters SET satisfied_by_attempt=?2 WHERE id=?1",
+                                    params![id.clone(), attempt_id.clone()],
+                                )
+                                .await?;
+                            }
+                        }
+                        let cohort = text(
+                            conn,
+                            "SELECT c.id FROM requests r JOIN request_cohorts c ON c.id=r.cohort_id WHERE r.id=?1 AND c.state='open'",
+                            params![child.clone()],
+                        )
+                        .await?;
+                        if let Some(cohort) = cohort {
+                            recompute(conn, &cohort, now).await?;
+                        }
+                    }
+                    conn.execute(
+                        "UPDATE request_chains SET state='satisfied',updated_at=?2 WHERE parent_attempt_id=?1 AND state='pending'",
+                        params![parent.clone(), now],
+                    )
+                    .await?;
+                }
+            }
+            let woken = chain.child_request_id.clone().unwrap_or(parent_request);
+            changed(conn, &woken, true, now).await?;
+            chain_conn(conn, &parent)
+                .await?
+                .ok_or_else(|| error("the chain disappeared"))
+        })
+    })
+    .await
+}
+
+/// Writes the acceptance a chain derives from its parent's verified report,
+/// in one transaction with its journal event and the chain row's `accepted`
+/// state. Refuses unless the parent attempt is done with a receipt naming
+/// this commit, its bound act names this kind as `then`, its policy covers
+/// this kind's, the operator attribution is the parent's, and the chain is
+/// pending, inside its window, and names this kind, commit and request.
+/// Whether every active contribution is contained in the commit is a
+/// consumer's question: the caller answers it against the card at
+/// `a.revision`, which this transaction pins.
+pub async fn accept_chained_request(
+    db: &LocalDb,
+    a: &RequestAcceptance,
+) -> DbResult<RequestAttempt> {
+    validate_acceptance(a)?;
+    let from = a
+        .chained_from
+        .clone()
+        .ok_or_else(|| error("a chained acceptance names its parent"))?;
+    let a = a.clone();
+    db.exclusive(move |conn| {
+        let (a, from) = (a.clone(), from.clone());
+        Box::pin(async move {
+            let chain = chain_conn(conn, &from.parent_attempt_id)
+                .await?
+                .ok_or_else(|| error("chained acceptance refused: its parent has no chain"))?;
+            if chain.state != ChainState::Pending {
+                return Err(error("chained acceptance refused: the chain is not pending"));
+            }
+            if a.accepted_at.saturating_mul(1000) >= chain.deadline_unix_ms {
+                return Err(error(
+                    "chained acceptance refused: the acceptance's chain window closed",
+                ));
+            }
+            if chain.kind != a.kind
+                || a.candidate_commit.as_deref() != Some(chain.commit.as_str())
+                || chain
+                    .child_request_id
+                    .as_ref()
+                    .is_none_or(|child| !a.request_ids.contains(child))
+            {
+                return Err(error(
+                    "chained acceptance refused: it names another kind, commit or request than its chain",
+                ));
+            }
+            parent_provenance(conn, &a, &from).await?;
+            let attempt = accept_conn(conn, &a).await?;
+            let n = conn
+                .execute(
+                    "UPDATE request_chains SET state='accepted',child_attempt_id=?2,updated_at=?3 WHERE parent_attempt_id=?1 AND state='pending'",
+                    params![from.parent_attempt_id.clone(), a.attempt_id.clone(), a.accepted_at],
+                )
+                .await?;
+            if n != 1 {
+                return Err(error("chained acceptance lost its chain row"));
+            }
+            Ok(attempt)
+        })
+    })
+    .await
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReportReceiptWire {
     outcome: RequestAttemptOutcome,
     report: Value,
     settled: bool,
-    covered: Vec<String>,
 }
 
-fn frozen_report_coverage(
+/// A redelivered receipt is effect-free only when it carries exactly the bytes
+/// the first delivery committed.
+fn frozen_receipt_matches(
     wire: &str,
     outcome: &RequestAttemptOutcome,
     document: &Value,
     settled: bool,
-) -> DbResult<Vec<String>> {
+) -> DbResult<()> {
     let frozen: ReportReceiptWire = decode(wire)?;
     if frozen.outcome != *outcome || frozen.report != *document || frozen.settled != settled {
         return Err(error("conflicting consumer receipt bytes"));
     }
-    if frozen.covered.iter().any(|id| !nonblank(id))
-        || (frozen.outcome == RequestAttemptOutcome::Done && !frozen.settled)
-    {
+    if frozen.outcome == RequestAttemptOutcome::Done && !frozen.settled {
         return Err(error("consumer receipt evidence is malformed"));
     }
-    // Coverage is a host-derived decision, not consumer input. Concurrent
-    // redelivery may observe a different OPEN set after the first fulfillment.
-    // The first committed receipt wins; replay cannot add any later coverage.
-    Ok(frozen.covered)
-}
-
-/// Reuse the first receipt's derived coverage on an identical consumer report.
-/// Recomputing it after fulfillment would depend on a different set of OPEN
-/// requests and turn an ordinary redelivery into conflicting receipt bytes.
-#[allow(clippy::too_many_arguments)]
-pub async fn report_receipt_coverage(
-    db: &LocalDb,
-    attempt: &str,
-    claim: &str,
-    receipt: &str,
-    outcome: &RequestAttemptOutcome,
-    document: &Value,
-    settled: bool,
-) -> DbResult<Option<Vec<String>>> {
-    let (attempt, claim, receipt) = (attempt.to_string(), claim.to_string(), receipt.to_string());
-    let outcome = outcome.clone();
-    let document = document.clone();
-    db.read(move |conn| {
-        let (attempt, claim, receipt, outcome, document) = (
-            attempt.clone(),
-            claim.clone(),
-            receipt.clone(),
-            outcome.clone(),
-            document.clone(),
-        );
-        Box::pin(async move {
-            let mut rows = conn.query(
-                "SELECT attempt_id,claim_id,report_json FROM request_report_receipts WHERE id=?1",
-                params![receipt.as_str()],
-            ).await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            if row.text(0)? != attempt || row.text(1)? != claim {
-                return Err(error("conflicting consumer receipt attribution"));
-            }
-            frozen_report_coverage(&row.text(2)?, &outcome, &document, settled).map(Some)
-        })
-    })
-    .await
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1450,6 +1991,7 @@ mod tests {
             policy_project_id: Some("canonical".into()),
             drain: None,
             fenced_command: None,
+            chained_from: None,
             operator,
             appearance,
             accepted_at: 3,
@@ -1459,6 +2001,13 @@ mod tests {
         db.query_one(format!("SELECT COUNT(*) FROM {table}"), (), |r| r.i64(0))
             .await
             .unwrap()
+    }
+    async fn request_number(db: &LocalDb, id: &str) -> u64 {
+        use crate::storage::address_numbers::{number_of, Numbered};
+        number_of(db, Numbered::OperatorRequest, None, id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("request {id} has no number"))
     }
     #[tokio::test]
     async fn filing_is_coalesced_idempotent_and_preserves_distinct_rationales() {
@@ -1479,28 +2028,6 @@ mod tests {
         assert_eq!(count(&db, "request_cohorts").await, 1);
         assert_eq!(count(&db, "request_waiting").await, 2);
         assert_eq!(count(&db, "authorization_events").await, 0);
-    }
-    #[tokio::test]
-    async fn joins_and_withdrawals_recompute_fixed_bump_minima() {
-        let db = db().await;
-        let a = file_request(&db, &input(RequestKind::BumpVersion, "a", Some("2.9.0")), 1)
-            .await
-            .unwrap();
-        let b = file_request(
-            &db,
-            &input(RequestKind::BumpVersion, "b", Some("2.10.0")),
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(b.request.id, a.request.id);
-        assert_eq!(b.request.target.as_deref(), Some("2.10.0"));
-        let r = withdraw_request(&db, &a.request.id, "b", 3).await.unwrap();
-        assert_eq!(r.target.as_deref(), Some("2.9.0"));
-        assert_eq!(r.state, RequestState::Open);
-        let r = withdraw_request(&db, &a.request.id, "a", 4).await.unwrap();
-        assert_eq!(r.state, RequestState::Withdrawn);
-        assert_eq!(r.requesters.iter().filter(|c| c.active).count(), 0);
     }
     #[tokio::test]
     async fn acceptance_is_atomic_with_journal_members_and_dispatch() {
@@ -1811,88 +2338,6 @@ mod tests {
             .all(|c| c.satisfied_by_attempt.as_deref() == Some(a.attempt_id.as_str())));
     }
     #[tokio::test]
-    async fn bump_report_links_only_proven_contributions_atomically_without_acceptance() {
-        let db = db().await;
-        let rebuild = file_request(&db, &input(RequestKind::Rebuild, "a", None), 1)
-            .await
-            .unwrap();
-        file_request(&db, &input(RequestKind::Rebuild, "b", None), 1)
-            .await
-            .unwrap();
-        let ids = get_request(&db, &rebuild.request.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .requesters
-            .iter()
-            .map(|c| c.id.clone())
-            .collect::<Vec<_>>();
-        let bump = file_request(&db, &input(RequestKind::BumpVersion, "c", Some("3.0.0")), 1)
-            .await
-            .unwrap();
-        let a = envelope(&db, &bump.request.id).await;
-        let attempt = accept_request(&db, &a).await.unwrap();
-        claim_request(&db, &attempt.authorization_event_id, &a, "claim", 4)
-            .await
-            .unwrap();
-        assert!(report_request_with_fulfillment(
-            &db,
-            &a.attempt_id,
-            "claim",
-            "bad",
-            RequestAttemptOutcome::Done,
-            json!({}),
-            true,
-            &["missing".into()],
-            5
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            get_attempt_by_event(&db, &attempt.authorization_event_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            RequestState::Acting
-        );
-        report_request_with_fulfillment(
-            &db,
-            &a.attempt_id,
-            "claim",
-            "done",
-            RequestAttemptOutcome::Done,
-            json!({}),
-            true,
-            &ids[..1],
-            5,
-        )
-        .await
-        .unwrap();
-        let r = get_request(&db, &rebuild.request.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(r.state, RequestState::Open);
-        assert!(r.current_attempt.is_none());
-        assert!(r.attempts.is_empty());
-        assert!(
-            !request_gate_state(&db, &r.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .accepted
-        );
-        fulfill_rebuild_contributions(&db, &a.attempt_id, &ids[1..], json!({}), 6)
-            .await
-            .unwrap();
-        assert_eq!(
-            get_request(&db, &r.id).await.unwrap().unwrap().state,
-            RequestState::Done
-        );
-        assert_eq!(count(&db, "authorization_events").await, 1);
-    }
-    #[tokio::test]
     async fn generic_journal_append_cannot_write_request_accepted() {
         let db = db().await;
         let event = authority::NewAuthorizationEvent {
@@ -2156,26 +2601,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_raw_filing_preserves_original_fixed_minima_after_main_or_version_changes() {
-        let db = db().await;
-        let mut ask = input(RequestKind::BumpVersion, "origin", Some("2.0.0"));
-        ask.contribution.normalized_target = json!({"filing":{"target":"sm","requirements":{"commits":[]}},"minimumVersion":"2.0.0"});
-        let first = file_request(&db, &ask, 1).await.unwrap();
-        ask.target = Some("3.0.0".into());
-        ask.contribution.minimum_target = Some("3.0.0".into());
-        ask.contribution.requirements.commits = vec!["b".repeat(40)];
-        ask.contribution.normalized_target["minimumVersion"] = json!("3.0.0");
-        let again = file_request(&db, &ask, 2).await.unwrap();
-        assert_eq!(first.request.id, again.request.id);
-        assert_eq!(first.request.revision, again.request.revision);
-        assert_eq!(again.request.requesters.len(), 1);
-        assert_eq!(again.request.target.as_deref(), Some("2.0.0"));
-        assert_eq!(
-            again.request.requesters[0].minimum_target.as_deref(),
-            Some("2.0.0")
-        );
-    }
-    #[tokio::test]
     async fn dispatch_recovery_validates_history_but_never_retries_unresolved_actor() {
         let db = db().await;
         let r = file_request(&db, &input(RequestKind::Rebuild, "a", None), 1)
@@ -2391,56 +2816,6 @@ mod tests {
             .iter()
             .any(|c| c.origin_uri == "a" && !c.active));
     }
-    #[tokio::test]
-    async fn withdrawing_last_uncovered_contribution_finishes_a_partially_fulfilled_card() {
-        let db = db().await;
-        let rebuild = file_request(&db, &input(RequestKind::Rebuild, "a", None), 1)
-            .await
-            .unwrap();
-        file_request(&db, &input(RequestKind::Rebuild, "b", None), 2)
-            .await
-            .unwrap();
-        let contribution = rebuild.request.requesters[0].id.clone();
-        let bump = file_request(&db, &input(RequestKind::BumpVersion, "c", Some("3.0.0")), 3)
-            .await
-            .unwrap();
-        let a = envelope(&db, &bump.request.id).await;
-        let accepted = accept_request(&db, &a).await.unwrap();
-        claim_request(&db, &accepted.authorization_event_id, &a, "claim", 4)
-            .await
-            .unwrap();
-        report_request_with_fulfillment(
-            &db,
-            &a.attempt_id,
-            "claim",
-            "done",
-            RequestAttemptOutcome::Done,
-            json!({}),
-            true,
-            &[contribution],
-            5,
-        )
-        .await
-        .unwrap();
-        let done = withdraw_request(&db, &rebuild.request.id, "b", 6)
-            .await
-            .unwrap();
-        assert_eq!(done.state, RequestState::Done);
-        let cards = list_requests(
-            &db,
-            "default",
-            &RequestFilter {
-                status: Some(RequestState::Done),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(cards.iter().any(|c| c.id == done.id));
-        let gate = request_gate_state(&db, &done.id).await.unwrap().unwrap();
-        assert_eq!(gate.state, RequestState::Done);
-        assert!(!gate.accepted);
-    }
 
     async fn wake_ids(db: &LocalDb) -> std::collections::BTreeSet<String> {
         pending_outbox(db, 200)
@@ -2653,50 +3028,6 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn linked_fulfillment_and_failure_notes_share_one_wake_per_destination() {
-        for success in [true, false] {
-            let db = db().await;
-            let rebuild = two_member_cohort(&db).await;
-            let covered: Vec<_> = rebuild
-                .requesters
-                .iter()
-                .filter(|c| c.active)
-                .map(|c| c.id.clone())
-                .collect();
-            let bump = file_request(&db, &input(RequestKind::BumpVersion, "c", Some("3.0.0")), 7)
-                .await
-                .unwrap();
-            let mut a = envelope(&db, &bump.request.id).await;
-            a.accepted_at = 10;
-            let accepted = accept_request(&db, &a).await.unwrap();
-            claim_request(&db, &accepted.authorization_event_id, &a, "claim", 11)
-                .await
-                .unwrap();
-            let before = wake_ids(&db).await;
-            let outcome = if success {
-                RequestAttemptOutcome::Done
-            } else {
-                RequestAttemptOutcome::Failed
-            };
-            report_request_with_fulfillment(
-                &db,
-                &a.attempt_id,
-                "claim",
-                "report",
-                outcome,
-                json!({}),
-                true,
-                if success { &covered } else { &[] },
-                12,
-            )
-            .await
-            .unwrap();
-            let mut members = rebuild.member_request_ids.clone();
-            members.push(bump.request.id);
-            assert_new_wakes(&db, &before, 1, &members, &["a", "b", "c"]).await;
-        }
-    }
-    #[tokio::test]
     async fn multi_member_wakes_preserve_distinct_routed_destinations() {
         let db = db().await;
         let card = two_member_cohort(&db).await;
@@ -2743,7 +3074,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn terminal_failure_details_cannot_be_upgraded_to_success_or_linked_fulfillment() {
+    async fn terminal_failure_details_cannot_be_upgraded_to_success() {
         for initial in [
             RequestAttemptOutcome::Failed,
             RequestAttemptOutcome::RolledBack,
@@ -2754,11 +3085,7 @@ mod tests {
             let rebuild = file_request(&db, &input(RequestKind::Rebuild, "a", None), 1)
                 .await
                 .unwrap();
-            let covered = vec![rebuild.request.requesters[0].id.clone()];
-            let bump = file_request(&db, &input(RequestKind::BumpVersion, "b", Some("3.0.0")), 2)
-                .await
-                .unwrap();
-            let a = envelope(&db, &bump.request.id).await;
+            let a = envelope(&db, &rebuild.request.id).await;
             let accepted = accept_request(&db, &a).await.unwrap();
             claim_request(&db, &accepted.authorization_event_id, &a, "claim", 4)
                 .await
@@ -2779,7 +3106,7 @@ mod tests {
             assert_eq!(failed.outcome, Some(initial.clone()));
             let wakes_before = wake_ids(&db).await;
             let receipts_before = count(&db, "request_report_receipts").await;
-            let error = report_request_with_fulfillment(
+            let error = report_request(
                 &db,
                 &a.attempt_id,
                 "claim",
@@ -2787,7 +3114,6 @@ mod tests {
                 RequestAttemptOutcome::Done,
                 json!({"boot":"late-success"}),
                 true,
-                &covered,
                 6,
             )
             .await
@@ -2802,18 +3128,17 @@ mod tests {
             );
             assert_eq!(count(&db, "request_report_receipts").await, receipts_before);
             assert_eq!(wake_ids(&db).await, wakes_before);
-            let linked = get_request(&db, &rebuild.request.id)
+            let unfulfilled = get_request(&db, &rebuild.request.id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(linked.state, RequestState::Open);
-            assert!(linked.fulfilled_by_attempt.is_none());
-            assert!(linked
+            assert!(unfulfilled.fulfilled_by_attempt.is_none());
+            assert!(unfulfilled
                 .requesters
                 .iter()
                 .all(|c| c.satisfied_by_attempt.is_none()));
             assert_eq!(
-                request_gate_state(&db, &bump.request.id)
+                request_gate_state(&db, &rebuild.request.id)
                     .await
                     .unwrap()
                     .unwrap()
@@ -2850,14 +3175,6 @@ mod tests {
             assert_eq!(settled.state, RequestState::Failed);
             assert_eq!(settled.outcome, Some(initial));
             assert_eq!(
-                get_request(&db, &bump.request.id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                RequestState::Open
-            );
-            assert_eq!(
                 get_request(&db, &rebuild.request.id)
                     .await
                     .unwrap()
@@ -2869,41 +3186,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authoritative_report_replay_keeps_first_coverage_after_concurrent_prelookup_miss() {
+    async fn identical_receipt_replay_is_effect_free_and_changed_bytes_refuse() {
         let db = db().await;
         let rebuild = file_request(&db, &input(RequestKind::Rebuild, "original", None), 1)
             .await
             .unwrap();
-        let covered = vec![rebuild.request.requesters[0].id.clone()];
-        let bump = file_request(
-            &db,
-            &input(RequestKind::BumpVersion, "bumper", Some("3.0.0")),
-            2,
-        )
-        .await
-        .unwrap();
-        let a = envelope(&db, &bump.request.id).await;
+        let a = envelope(&db, &rebuild.request.id).await;
         let accepted = accept_request(&db, &a).await.unwrap();
         claim_request(&db, &accepted.authorization_event_id, &a, "claim", 4)
             .await
             .unwrap();
         let document = json!({"evidence":{"verified_boot":"boot"},"builtCommit":"c".repeat(40)});
-        // Both callers miss the advisory lookup before the first one commits.
-        for _ in 0..2 {
-            assert!(report_receipt_coverage(
-                &db,
-                &a.attempt_id,
-                "claim",
-                "stable",
-                &RequestAttemptOutcome::Done,
-                &document,
-                true
-            )
-            .await
-            .unwrap()
-            .is_none());
-        }
-        let done = report_request_with_fulfillment(
+        let done = report_request(
             &db,
             &a.attempt_id,
             "claim",
@@ -2911,7 +3205,6 @@ mod tests {
             RequestAttemptOutcome::Done,
             document.clone(),
             true,
-            &covered,
             5,
         )
         .await
@@ -2927,17 +3220,8 @@ mod tests {
         let mut late_input = input(RequestKind::Rebuild, "late", None);
         late_input.contribution.requirements.commits = vec!["d".repeat(40)];
         let late = file_request(&db, &late_input, 6).await.unwrap();
-        let proposed = vec![late.request.requesters[0].id.clone()];
         assert_ne!(late.request.id, rebuild.request.id);
-
-        let another = file_request(
-            &db,
-            &input(RequestKind::BumpVersion, "another", Some("4.0.0")),
-            7,
-        )
-        .await
-        .unwrap();
-        let other_acceptance = envelope(&db, &another.request.id).await;
+        let other_acceptance = envelope(&db, &late.request.id).await;
         let other = accept_request(&db, &other_acceptance).await.unwrap();
         let other = claim_request(
             &db,
@@ -2963,44 +3247,25 @@ mod tests {
             .unwrap()
             .unwrap();
         let late_before = get_request(&db, &late.request.id).await.unwrap().unwrap();
-        // The second caller's derived coverage can be empty or include a new
-        // ask. Neither is consumer evidence, and neither can replace the winner.
-        for derived in [Vec::new(), proposed] {
-            let replay = report_request_with_fulfillment(
-                &db,
-                &a.attempt_id,
-                "claim",
-                "stable",
-                RequestAttemptOutcome::Done,
-                document.clone(),
-                true,
-                &derived,
-                9,
-            )
-            .await
-            .unwrap();
-            assert_eq!(replay, done);
-            assert_eq!(
-                report_receipt_coverage(
-                    &db,
-                    &a.attempt_id,
-                    "claim",
-                    "stable",
-                    &RequestAttemptOutcome::Done,
-                    &document,
-                    true
-                )
-                .await
-                .unwrap(),
-                Some(covered.clone())
-            );
-        }
+        let replay = report_request(
+            &db,
+            &a.attempt_id,
+            "claim",
+            "stable",
+            RequestAttemptOutcome::Done,
+            document.clone(),
+            true,
+            9,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay, done);
         let mut changed_report = document.clone();
         changed_report["evidence"]["verified_boot"] = json!("other-boot");
         let mut changed_commit = document.clone();
         changed_commit["builtCommit"] = json!("e".repeat(40));
         for changed in [changed_report, changed_commit] {
-            assert!(report_request_with_fulfillment(
+            assert!(report_request(
                 &db,
                 &a.attempt_id,
                 "claim",
@@ -3008,13 +3273,12 @@ mod tests {
                 RequestAttemptOutcome::Done,
                 changed,
                 true,
-                &[],
                 9
             )
             .await
             .is_err());
         }
-        assert!(report_request_with_fulfillment(
+        assert!(report_request(
             &db,
             &a.attempt_id,
             "claim",
@@ -3022,12 +3286,11 @@ mod tests {
             RequestAttemptOutcome::Failed,
             document.clone(),
             true,
-            &[],
             9
         )
         .await
         .is_err());
-        assert!(report_request_with_fulfillment(
+        assert!(report_request(
             &db,
             &a.attempt_id,
             "claim",
@@ -3035,12 +3298,11 @@ mod tests {
             RequestAttemptOutcome::Done,
             document.clone(),
             false,
-            &[],
             9
         )
         .await
         .is_err());
-        assert!(report_request_with_fulfillment(
+        assert!(report_request(
             &db,
             &a.attempt_id,
             "wrong-claim",
@@ -3048,12 +3310,11 @@ mod tests {
             RequestAttemptOutcome::Done,
             document.clone(),
             true,
-            &[],
             9
         )
         .await
         .is_err());
-        assert!(report_request_with_fulfillment(
+        assert!(report_request(
             &db,
             &other.id,
             "claim",
@@ -3061,7 +3322,6 @@ mod tests {
             RequestAttemptOutcome::Done,
             document,
             true,
-            &[],
             9
         )
         .await
@@ -3102,11 +3362,6 @@ mod tests {
             get_request(&db, &late.request.id).await.unwrap().unwrap(),
             late_before
         );
-        assert_eq!(late_before.state, RequestState::Open);
-        assert!(late_before
-            .requesters
-            .iter()
-            .all(|c| c.satisfied_by_attempt.is_none()));
         assert_eq!(
             serde_json::to_value(pending_outbox(&db, 200).await.unwrap()).unwrap(),
             outbox_before
@@ -3214,5 +3469,662 @@ mod tests {
         }
         let added=db.query_one("SELECT COUNT(*) FROM authorization_events WHERE request_acceptance_json IS NOT NULL".to_string(),(),|r|r.i64(0)).await.unwrap();
         assert_eq!(added, 0);
+    }
+
+    mod chain {
+        use super::*;
+
+        pub(super) const DESTINATION: &str = "cairn://p/cairn/devops";
+
+        pub(super) fn landed() -> String {
+            "c".repeat(40)
+        }
+
+        fn declared(then: Option<RequestKind>) -> FencedCommandAct {
+            FencedCommandAct {
+                executor_id: "exec".into(),
+                device_id: "device".into(),
+                project_id: "project".into(),
+                branch: "main".into(),
+                commit: "d".repeat(40),
+                cwd: String::new(),
+                command: "bun run bumpver --files-only 1.2.4".into(),
+                timeout_ms: 60_000,
+                node: "cairn://p/cairn/1/1/builder".into(),
+                declaration: Some(DeclaredAct {
+                    name: "bump".into(),
+                    label: "Bump the version".into(),
+                    consequence: "lands 1.2.4".into(),
+                    params: vec![],
+                    defined_by_commit: "d".repeat(40),
+                    declaration_digest: "e".repeat(64),
+                    lands: Some(DeclaredLands {
+                        paths: vec!["package.json".into()],
+                        message: "bump 1.2.4".into(),
+                    }),
+                    then,
+                }),
+            }
+        }
+
+        /// A declared fenced act filed by `origin`, accepted, claimed and
+        /// reported `Done` on `commit` at time 5.
+        pub(super) async fn landed_parent(
+            db: &LocalDb,
+            origin: &str,
+            then: Option<RequestKind>,
+            commit: &str,
+        ) -> RequestAcceptance {
+            let act = declared(then);
+            let encoded = serde_json::to_string(&act).unwrap();
+            let mut filing = input(RequestKind::FencedCommand, origin, None);
+            filing.target = Some(encoded.clone());
+            filing.target_identity = act.executor_id.clone();
+            filing.coalescing_key = Some(format!("fenced:{origin}"));
+            filing.contribution.requirements = RequestRequirements::default();
+            let filed = file_request(db, &filing, 1).await.unwrap();
+            let mut a = envelope(db, &filed.request.id).await;
+            a.target = Some(encoded);
+            a.target_identity = act.executor_id.clone();
+            a.candidate_commit = None;
+            a.base_commit = None;
+            a.policy_project_id = None;
+            a.fenced_command = Some(FencedCommandAcceptance {
+                act,
+                witness: ExecutorFloorWitness {
+                    connection_generation: 1,
+                    executor_build_id: "build".into(),
+                    boot_generation: "boot".into(),
+                    floor_fingerprint: "f".repeat(64),
+                    floor_measured_at_unix_ms: 1,
+                },
+                scratch_head: None,
+            });
+            let attempt = accept_request(db, &a).await.unwrap();
+            claim_request(db, &attempt.authorization_event_id, &a, "claim", 4)
+                .await
+                .unwrap();
+            report_request(
+                db,
+                &a.attempt_id,
+                "claim",
+                &format!("landed:{}", a.attempt_id),
+                RequestAttemptOutcome::Done,
+                json!({"evidence":{"landedCommit":commit},"builtCommit":commit}),
+                true,
+                5,
+            )
+            .await
+            .unwrap();
+            a
+        }
+
+        pub(super) fn rebuild_input() -> NormalizedRequest {
+            let mut filing = input(RequestKind::Rebuild, "unused", None);
+            filing.contribution.rationale = "bump landed; rebuild it".into();
+            filing
+        }
+
+        pub(super) async fn event_of(db: &LocalDb, attempt: &str) -> String {
+            get_attempt(db, attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .authorization_event_id
+        }
+
+        /// The chained acceptance for `child` that `accept_chained_request`
+        /// takes, at time 7.
+        pub(super) async fn chained(
+            db: &LocalDb,
+            parent: &RequestAcceptance,
+            child: &str,
+        ) -> RequestAcceptance {
+            let mut c = envelope(db, child).await;
+            c.candidate_commit = Some(landed());
+            c.base_commit = None;
+            c.operator = parent.operator.clone();
+            c.appearance = parent.appearance.clone();
+            c.chained_from = Some(ChainedFrom {
+                parent_attempt_id: parent.attempt_id.clone(),
+                parent_authorization_event_id: event_of(db, &parent.attempt_id).await,
+                parent_binding_digest: parent.binding.digest.clone(),
+            });
+            c.accepted_at = 7;
+            c
+        }
+
+        pub(super) async fn origin_count(db: &LocalDb, origin: &str) -> i64 {
+            db.query_one(
+                "SELECT COUNT(*) FROM request_requesters WHERE origin_uri=?1",
+                params![origin],
+                |r| r.i64(0),
+            )
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_done_report_writes_one_chain_row_per_parent_and_per_landed_commit() {
+            let db = db().await;
+            let parent = landed_parent(&db, "a", Some(RequestKind::Rebuild), &landed()).await;
+            let chain = get_chain(&db, &parent.attempt_id).await.unwrap().unwrap();
+            assert_eq!(chain.state, ChainState::Pending);
+            assert_eq!(chain.kind, RequestKind::Rebuild);
+            assert_eq!(chain.commit, landed());
+            assert_eq!(chain.deadline_unix_ms, 5_000 + CHAIN_WINDOW_MS);
+            assert_eq!(chain.wake_destinations, [DESTINATION]);
+            assert_eq!(chain.child_request_id, None);
+            let wakes: Vec<_> = pending_outbox(&db, 200)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|o| o.kind == "chain")
+                .collect();
+            assert_eq!(wakes.len(), 1);
+            assert_eq!(
+                wakes[0].payload,
+                json!({"parent_attempt_id":parent.attempt_id})
+            );
+
+            let attempt = parent.attempt_id.clone();
+            let duplicate = db
+                .write(move |c| {
+                    let attempt = attempt.clone();
+                    Box::pin(async move {
+                        c.execute("INSERT INTO request_chains(parent_attempt_id,kind,commit_id,deadline_unix_ms,state,wake_destinations_json,created_at,updated_at) VALUES(?1,'rebuild',?2,1,'pending','[]',1,1)", params![attempt, "9".repeat(40)]).await?;
+                        Ok(())
+                    })
+                })
+                .await;
+            assert!(duplicate.is_err(), "a second row for one parent");
+
+            // A re-accept after Inconclusive, or recovery's adoption, reports
+            // Done on the same landed commit under another attempt: no row.
+            let again = landed_parent(&db, "b", Some(RequestKind::Rebuild), &landed()).await;
+            assert!(get_chain(&db, &again.attempt_id).await.unwrap().is_none());
+            // An act that names no `then` chains nothing.
+            let plain = landed_parent(&db, "c", None, &"9".repeat(40)).await;
+            assert!(get_chain(&db, &plain.attempt_id).await.unwrap().is_none());
+            assert_eq!(count(&db, "request_chains").await, 1);
+            let wakes = pending_outbox(&db, 200)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|o| o.kind == "chain")
+                .count();
+            assert_eq!(wakes, 1);
+        }
+
+        #[tokio::test]
+        async fn the_chained_acceptance_is_filed_once_and_journals_its_parent() {
+            let db = db().await;
+            let parent = landed_parent(&db, "a", Some(RequestKind::Rebuild), &landed()).await;
+            let parent_uri =
+                cairn_uri::build_request_uri(request_number(&db, &parent.request_ids[0]).await);
+            let child = file_chained_request(&db, &parent.attempt_id, &rebuild_input(), 6)
+                .await
+                .unwrap();
+            // A crash between filing and acceptance replays from the row.
+            let replay = file_chained_request(&db, &parent.attempt_id, &rebuild_input(), 6)
+                .await
+                .unwrap();
+            assert_eq!(replay, child);
+            assert_eq!(origin_count(&db, &parent_uri).await, 1);
+            let card = get_request(&db, &child).await.unwrap().unwrap();
+            let ask = card
+                .requesters
+                .iter()
+                .find(|c| c.origin_uri == parent_uri)
+                .unwrap();
+            assert_eq!(ask.requirements.commits, [landed()]);
+            assert_eq!(ask.wake_destination, DESTINATION);
+            // The parent's read links the chained card by its address.
+            let parent_card = get_request(&db, &parent.request_ids[0])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parent_card.chains,
+                [RequestChainLink {
+                    parent_attempt_id: parent.attempt_id.clone(),
+                    kind: RequestKind::Rebuild,
+                    commit: landed(),
+                    state: ChainState::Pending,
+                    deadline_unix_ms: 5_000 + CHAIN_WINDOW_MS,
+                    child_request_uri: Some(cairn_uri::build_request_uri(
+                        request_number(&db, &child).await
+                    )),
+                    refusal: None,
+                }]
+            );
+            assert!(card.chains.is_empty(), "the child started no chain");
+            // Filing hands the parent's requester a reference to the card.
+            assert!(pending_outbox(&db, 200).await.unwrap().iter().any(|o| {
+                o.kind == "reference"
+                    && o.request_id == child
+                    && o.destination.as_deref() == Some(DESTINATION)
+            }));
+
+            let good = chained(&db, &parent, &child).await;
+            let mut refused = vec![];
+            let mut other_commit = good.clone();
+            other_commit.candidate_commit = Some("a".repeat(40));
+            refused.push(
+                accept_chained_request(&db, &other_commit)
+                    .await
+                    .unwrap_err(),
+            );
+            let mut late = good.clone();
+            late.accepted_at = (5_000 + CHAIN_WINDOW_MS) / 1000;
+            refused.push(accept_chained_request(&db, &late).await.unwrap_err());
+            // The same principal, appearing at another moment: still not the
+            // parent's attribution.
+            let mut other_operator = good.clone();
+            other_operator.appearance = {
+                let a = &parent.appearance;
+                let evidence = AppearanceEvidence::new(
+                    AppearanceTransport::AuthenticatedOperator,
+                    Address::Invoke { origin: None },
+                    a.evidence().verification.clone(),
+                    2,
+                    None,
+                )
+                .unwrap();
+                AppearanceSnapshot::new(a.principal().clone(), evidence, vec![], None).unwrap()
+            };
+            refused.push(
+                accept_chained_request(&db, &other_operator)
+                    .await
+                    .unwrap_err(),
+            );
+            let mut other_digest = good.clone();
+            other_digest
+                .chained_from
+                .as_mut()
+                .unwrap()
+                .parent_binding_digest = "0".repeat(64);
+            refused.push(
+                accept_chained_request(&db, &other_digest)
+                    .await
+                    .unwrap_err(),
+            );
+            for error in &refused {
+                assert!(
+                    error.to_string().contains("chained acceptance refused"),
+                    "{error}"
+                );
+            }
+            assert!(
+                accept_request(&db, &good).await.is_err(),
+                "the operator path"
+            );
+            assert_eq!(count(&db, "authorization_events").await, 1);
+
+            let attempt = accept_chained_request(&db, &good).await.unwrap();
+            assert_eq!(attempt.acceptance, good);
+            assert_eq!(attempt.acceptance.candidate_commit, Some(landed()));
+            let journal = authority::list_events(&db, "default", 10).await.unwrap();
+            assert_eq!(journal.len(), 2);
+            assert_eq!(journal[0].reason, authority::CHAINED_ACCEPTANCE_REASON);
+            assert_eq!(journal[0].outcome, "request_accepted");
+            assert_eq!(journal[0].request_acceptance, Some(good.clone()));
+            assert_eq!(
+                journal[0].request_uri,
+                Some(format!("cairn://requests/{child}"))
+            );
+            assert!(journal[0].grant_id.is_none());
+            let chain = get_chain(&db, &parent.attempt_id).await.unwrap().unwrap();
+            assert_eq!(chain.state, ChainState::Accepted);
+            assert_eq!(
+                chain.child_attempt_id.as_deref(),
+                Some(good.attempt_id.as_str())
+            );
+            let outbox = pending_outbox(&db, 200).await.unwrap();
+            assert!(outbox
+                .iter()
+                .any(|o| o.kind == "dispatch" && o.request_id == child));
+            // The chained contribution routes the child's wakes to the
+            // parent's requester.
+            assert!(outbox.iter().any(|o| o.kind == "wake"
+                && o.request_id == child
+                && o.destination.as_deref() == Some(DESTINATION)));
+            assert!(accept_chained_request(&db, &good).await.is_err(), "spent");
+
+            let event = attempt.authorization_event_id.clone();
+            claim_request(&db, &event, &good, "child-claim", 8)
+                .await
+                .unwrap();
+            recheck_request(&db, &event, &good, "child-claim")
+                .await
+                .unwrap();
+            // Every checked read re-proves the chain row, not only the write.
+            db.write(|c| {
+                Box::pin(async move {
+                    c.execute("UPDATE request_chains SET child_attempt_id='other'", ())
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+            let error = recheck_request(&db, &event, &good, "child-claim")
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("chained acceptance refused"),
+                "{error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_chained_attempt_returns_the_child_request_to_open() {
+            let db = db().await;
+            let parent = landed_parent(&db, "a", Some(RequestKind::Rebuild), &landed()).await;
+            let child = file_chained_request(&db, &parent.attempt_id, &rebuild_input(), 6)
+                .await
+                .unwrap();
+            let good = chained(&db, &parent, &child).await;
+            let attempt = accept_chained_request(&db, &good).await.unwrap();
+            claim_request(&db, &attempt.authorization_event_id, &good, "claim", 8)
+                .await
+                .unwrap();
+            report_request(
+                &db,
+                &good.attempt_id,
+                "claim",
+                "child-failed",
+                RequestAttemptOutcome::Failed,
+                json!({"detail":"executor-coverage refused"}),
+                true,
+                9,
+            )
+            .await
+            .unwrap();
+            let card = get_request(&db, &child).await.unwrap().unwrap();
+            assert_eq!(card.state, RequestState::Open);
+            assert_eq!(
+                get_chain(&db, &parent.attempt_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ChainState::Accepted
+            );
+        }
+
+        /// A chained acceptance journaled without `accept_chained_request`'s
+        /// checks, then the chain row marked accepted for it, as a forged or
+        /// corrupted store would hold it.
+        async fn forged(
+            db: &LocalDb,
+            forge: impl FnOnce(&mut RequestAcceptance, &str),
+        ) -> (String, RequestAcceptance) {
+            let parent = landed_parent(db, "a", Some(RequestKind::Rebuild), &landed()).await;
+            let other = landed_parent(db, "b", None, &"9".repeat(40)).await;
+            let child = file_chained_request(db, &parent.attempt_id, &rebuild_input(), 6)
+                .await
+                .unwrap();
+            let mut a = chained(db, &parent, &child).await;
+            forge(&mut a, &event_of(db, &other.attempt_id).await);
+            let (a2, parent_attempt) = (a.clone(), parent.attempt_id.clone());
+            let event = db
+                .exclusive(move |conn| {
+                    let (a, parent_attempt) = (a2.clone(), parent_attempt.clone());
+                    Box::pin(async move {
+                        let attempt = accept_conn(conn, &a).await?;
+                        conn.execute("UPDATE request_chains SET state='accepted',child_attempt_id=?2 WHERE parent_attempt_id=?1", params![parent_attempt, a.attempt_id.clone()]).await?;
+                        Ok(attempt.authorization_event_id)
+                    })
+                })
+                .await
+                .unwrap();
+            (event, a)
+        }
+
+        #[tokio::test]
+        async fn claim_refuses_a_chained_acceptance_whose_parent_provenance_differs() {
+            let db = db().await;
+            let (event, a) = forged(&db, |_, _| {}).await;
+            claim_request(&db, &event, &a, "claim", 8).await.unwrap();
+
+            type Forge = fn(&mut RequestAcceptance, &str);
+            let forgeries: [(&str, Forge); 4] = [
+                ("missing parent event", |a, _| {
+                    a.chained_from
+                        .as_mut()
+                        .unwrap()
+                        .parent_authorization_event_id = "missing".into()
+                }),
+                ("another acceptance's event", |a, other| {
+                    a.chained_from
+                        .as_mut()
+                        .unwrap()
+                        .parent_authorization_event_id = other.into()
+                }),
+                ("binding digest", |a, _| {
+                    a.chained_from.as_mut().unwrap().parent_binding_digest = "0".repeat(64)
+                }),
+                ("receipt commit", |a, _| {
+                    a.candidate_commit = Some("9".repeat(40))
+                }),
+            ];
+            for (name, forge) in forgeries {
+                let db = super::db().await;
+                let (event, a) = forged(&db, forge).await;
+                let error = claim_request(&db, &event, &a, "claim", 8)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("chained acceptance refused"),
+                    "{name}: {error}"
+                );
+                assert_eq!(count(&db, "request_report_receipts").await, 2, "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_bump_version_deletes_its_rows_and_the_store_still_reads() {
+        const RETIRED_KIND: &str = "bump_version";
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("migration.db"))
+            .await
+            .unwrap();
+        let migration = *TURSO_MIGRATIONS
+            .iter()
+            .find(|m| m.name() == "drop_bump_version_requests")
+            .unwrap();
+        let prior = TURSO_MIGRATIONS
+            .iter()
+            .filter(|m| m.version() < migration.version())
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(prior).run(&db).await.unwrap();
+
+        // A rebuild finished through the store, plus a receipt in the wire that
+        // still carried the `covered` key.
+        let rebuild = file_request(&db, &input(RequestKind::Rebuild, "a", None), 1)
+            .await
+            .unwrap();
+        let a = envelope(&db, &rebuild.request.id).await;
+        let accepted = accept_request(&db, &a).await.unwrap();
+        claim_request(&db, &accepted.authorization_event_id, &a, "claim", 4)
+            .await
+            .unwrap();
+        let report = json!({"built":"a"});
+        let done = report_request(
+            &db,
+            &a.attempt_id,
+            "claim",
+            "stable",
+            RequestAttemptOutcome::Done,
+            report.clone(),
+            true,
+            5,
+        )
+        .await
+        .unwrap();
+        let legacy_wire = encode(&json!({
+            "outcome":RequestAttemptOutcome::Done,"report":report,"settled":true,"covered":[]
+        }))
+        .unwrap();
+        let rebuild_attempt = a.attempt_id.clone();
+        db.exclusive(move |c| {
+            let (legacy_wire, rebuild_attempt) = (legacy_wire.clone(), rebuild_attempt.clone());
+            Box::pin(async move {
+                c.execute(
+                    "INSERT INTO request_report_receipts(id,attempt_id,claim_id,report_json,created_at) VALUES('legacy',?1,'claim',?2,5)",
+                    params![rebuild_attempt, legacy_wire],
+                )
+                .await?;
+                for statement in [
+                    "INSERT INTO request_cohorts(id,workspace_id,coalescing_key,kind,state,created_at,updated_at) VALUES('bump-cohort','default','retired:install',?1,'acting',1,1)",
+                    "INSERT INTO requests(id,workspace_id,kind,target,target_identity,coalescing_key,cohort_id,state,created_at,updated_at,current_attempt) VALUES('bump','default',?1,'2.0.0','install','retired:install','bump-cohort','acting',1,1,'bump-attempt')",
+                ] {
+                    c.execute(statement, params![RETIRED_KIND]).await?;
+                }
+                for statement in [
+                    "INSERT INTO request_cohort_members(cohort_id,request_id) VALUES('bump-cohort','bump')",
+                    "INSERT INTO request_requesters(id,request_id,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,minimum_target,normalized_target_json,filing_key,active,created_at) VALUES('bump-ask','bump','cairn://p/cairn/1','run','{}','cairn://p/cairn/devops','bump it','{\"commits\":[]}','2.0.0','{}','key',1,1)",
+                    "INSERT INTO request_waiting(contribution_id,uri) VALUES('bump-ask','cairn://p/cairn/1')",
+                    "INSERT INTO request_facts(cohort_id,version,revision,schema_version,observed_at,document_json) VALUES('bump-cohort',1,1,1,1,'{}')",
+                    "INSERT INTO authorization_events(id,scope_key,place_kind,action,scope_json,mutation,summary,outcome,reason,principal_json,audience_json,workspace_id,decided_at,actor_principal_json,appearance_snapshot_json,request_acceptance_json) VALUES('bump-event','scope','resource','run','{}','update','accept bump','request_accepted','accepted','{}','{}','default',1,'{}','{}','{\"facts_version\":1}')",
+                    "INSERT INTO request_attempts(id,cohort_id,authorization_event_id,acceptance_json,state,claim_id,updated_at) VALUES('bump-attempt','bump-cohort','bump-event','{\"facts_version\":1}','acting','claim',1)",
+                    "INSERT INTO request_attempt_members(attempt_id,request_id,contributions_json) VALUES('bump-attempt','bump','[\"bump-ask\"]')",
+                    "INSERT INTO request_outbox(id,request_id,kind,payload_json,created_at) VALUES('bump-wake','bump','wake','{}',1)",
+                    "INSERT INTO request_report_receipts(id,attempt_id,claim_id,report_json,created_at) VALUES('bump-receipt','bump-attempt','claim','{}',1)",
+                ] {
+                    c.execute(statement, ()).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let events_before = count(&db, "authorization_events").await;
+        let rebuild_number = request_number(&db, &rebuild.request.id).await;
+        let bump_number = request_number(&db, "bump").await;
+
+        MigrationRunner::new(vec![migration])
+            .run(&db)
+            .await
+            .unwrap();
+
+        for (table, column, value) in [
+            ("request_cohorts", "id", "bump-cohort"),
+            ("requests", "id", "bump"),
+            ("request_cohort_members", "request_id", "bump"),
+            ("request_requesters", "id", "bump-ask"),
+            ("request_waiting", "contribution_id", "bump-ask"),
+            ("request_facts", "cohort_id", "bump-cohort"),
+            ("request_attempts", "id", "bump-attempt"),
+            ("request_attempt_members", "attempt_id", "bump-attempt"),
+            ("request_outbox", "id", "bump-wake"),
+            ("request_report_receipts", "id", "bump-receipt"),
+        ] {
+            let left = db
+                .query_one(
+                    format!("SELECT COUNT(*) FROM {table} WHERE {column}='{value}'"),
+                    (),
+                    |r| r.i64(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(left, 0, "{table}");
+        }
+        assert_eq!(count(&db, "authorization_events").await, events_before);
+
+        // The rebuild keeps its address number, and the next filing is numbered
+        // past every number already issued, the deleted bump's included.
+        assert_eq!(
+            request_number(&db, &rebuild.request.id).await,
+            rebuild_number
+        );
+        let next = file_request(&db, &input(RequestKind::LiftDrain, "b", None), 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_number(&db, &next.request.id).await,
+            rebuild_number.max(bump_number) + 1
+        );
+        for (kind, name) in [
+            ("index", "idx_requests_number"),
+            ("trigger", "requests_number"),
+            ("trigger", "request_decline_immutable"),
+        ] {
+            let present = db
+                .query_one(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    params![kind, name],
+                    |r| r.i64(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(present, 1, "{name}");
+        }
+
+        let read = get_request(&db, &rebuild.request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.state, RequestState::Done);
+        assert_eq!(
+            read.fulfilled_by_attempt.as_deref(),
+            Some(a.attempt_id.as_str())
+        );
+        let listed = list_requests(&db, "default", &RequestFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            [next.request.id.as_str(), rebuild.request.id.as_str()]
+        );
+        // The legacy receipt now reads in the current wire, so its redelivery
+        // replays instead of refusing on an unknown key.
+        for receipt in ["stable", "legacy"] {
+            let replay = report_request(
+                &db,
+                &a.attempt_id,
+                "claim",
+                receipt,
+                RequestAttemptOutcome::Done,
+                report.clone(),
+                true,
+                6,
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay, done, "{receipt}");
+        }
+
+        for sql in [
+            "UPDATE request_report_receipts SET claim_id='other'",
+            "DELETE FROM request_report_receipts",
+            "DELETE FROM request_attempts",
+            "DELETE FROM request_attempt_members",
+            "DELETE FROM requests",
+        ] {
+            assert!(
+                db.write(|c| Box::pin(async move {
+                    c.execute(sql, ()).await?;
+                    Ok(())
+                }))
+                .await
+                .is_err(),
+                "{sql}"
+            );
+        }
+        assert!(db
+            .write(|c| Box::pin(async move {
+                c.execute(
+                    "INSERT INTO request_cohorts(id,workspace_id,kind,state,created_at,updated_at) VALUES('again','default',?1,'open',1,1)",
+                    params![RETIRED_KIND],
+                )
+                .await?;
+                Ok(())
+            }))
+            .await
+            .is_err());
     }
 }

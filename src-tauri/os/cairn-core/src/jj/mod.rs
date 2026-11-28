@@ -1,6 +1,9 @@
 //! Repository operations with Cairn's checkout repair policy.
 pub use cairn_vcs::jj::*;
 
+mod request_branch;
+pub use request_branch::*;
+
 // The main checkout can carry persistent tracked lockfile churn while the Dev
 // terminal or `bun dev:instance` runs from the project checkout. It is generated
 // by Cargo's two-workspace lockfile behavior and is safe to discard when a merge

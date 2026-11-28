@@ -34,6 +34,45 @@ fn walk_source_files(root: &std::path::Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// The `bump_version` request kind is gone; a version bump is a declared
+/// approved command on `fenced_command`. Only the migrations that created and
+/// then dropped it may still name it, and they are SQL, outside this walk.
+/// Test code is scanned too: a fixture of the kind cannot exist either. The
+/// one exception is the dropping migration's own test, which must seed a row
+/// of the kind and names it once, as `RETIRED_KIND`.
+#[test]
+fn the_bump_version_request_kind_is_named_nowhere() {
+    fn names_it(line: &str) -> bool {
+        ["bump_version", "BumpVersion"].iter().any(|needle| {
+            line.match_indices(needle).any(|(at, _)| {
+                let before = line[..at].chars().next_back();
+                !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        })
+    }
+    assert!(names_it("RequestKind::BumpVersion") && names_it("\"bump_version\""));
+    assert!(!names_it("fn pin_bump_versions_order()"));
+    let offenders: Vec<_> = workspace_rust_files()
+        .iter()
+        .filter(|(path, _)| !path.ends_with("tests/main/source_structure.rs"))
+        .flat_map(|(path, source)| {
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    names_it(line)
+                        && !(path.ends_with("cairn-db/src/storage/requests.rs")
+                            && line.trim_start().starts_with("const RETIRED_KIND: &str"))
+                })
+                .map(move |(index, _)| format!("{}:{}", path.display(), index + 1))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "bump_version is still named: {offenders:?}"
+    );
+}
+
 /// Ambient runs classify physical checkouts before executing the batch. A
 /// Cairn residence refuses publication; an unmanaged jj checkout seals locally
 /// without advancing a bookmark. Reading a marker after commands execute would

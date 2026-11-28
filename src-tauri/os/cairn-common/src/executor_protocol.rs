@@ -7286,6 +7286,15 @@ pub struct LearnedResourceEstimate {
 /// only; no frame or field changes, and an older executor is read exactly as
 /// before.
 ///
+/// cairn/7672 does not move the number. An accepted operator act that is a
+/// project-declared `lands` command now reaches its executor with
+/// `MutationPolicy::AllowDelta` and a base commit other than the one it was
+/// filed at (the default branch's tip when it runs). Both are fields an
+/// executor already reads and honours for every cell (regeneration and write
+/// checks send `AllowDelta` today, and an ownerless `AllowDelta` cell already
+/// returns its tracked writes as a delta), so an older executor runs exactly
+/// what it is sent and has nothing new to interpret.
+///
 /// cairn/7111 does not move the number. The runner refuses a launch whose
 /// complete serialized JSON exceeds the existing link frame limit, before
 /// issuing launch authority or enqueueing it. Admitted frames, runtime asset

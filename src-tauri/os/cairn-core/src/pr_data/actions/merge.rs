@@ -28,7 +28,7 @@ pub(super) enum BaseMergeGate {
 
 impl BaseMergeGate {
     /// The gate decision's journal state and detail (sequence 0).
-    fn journal(&self) -> (&'static str, Option<&'static str>) {
+    pub(super) fn journal(&self) -> (&'static str, Option<&'static str>) {
         match self {
             Self::NotApplicable => ("not_applicable", None),
             Self::Disabled => ("policy_disabled", None),
@@ -38,7 +38,7 @@ impl BaseMergeGate {
     }
 }
 
-fn enforce_human_base_merge_policy(
+pub(super) fn enforce_human_base_merge_policy(
     policy: &HumanBaseMergePolicyReadState,
     crosses_base: bool,
 ) -> BaseMergeGate {
@@ -71,10 +71,10 @@ fn enforce_human_base_merge_policy(
     }
 }
 
-async fn journal_policy_gate_event(
+pub(super) async fn journal_policy_gate_event(
     db: &LocalDb,
-    merge_context: &MergeMrContext,
-    job_id: &str,
+    subject: &super::context::LandingSubject,
+    owner_id: &str,
     state: &str,
     stored_policy: &str,
     attribution: Option<&super::PrResolutionAttribution>,
@@ -89,6 +89,18 @@ async fn journal_policy_gate_event(
         .to_string()
     });
     let event_id = Uuid::new_v4().to_string();
+    let detail = journal_detail(
+        &MergeAttemptJournal {
+            attempt_id: &event_id,
+            project_id: &subject.project_id,
+            merge_request_id: subject.merge_request_id(),
+            job_id: owner_id,
+            target_ref: &subject.target_branch,
+            source_ref: &subject.source_branch,
+            policy_json: stored_policy,
+        },
+        detail,
+    );
     db.execute(
         "INSERT INTO merge_attempt_events (
             event_id, attempt_id, sequence, project_id, merge_request_id, job_id,
@@ -97,15 +109,15 @@ async fn journal_policy_gate_event(
          ) VALUES (?1, ?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             event_id.as_str(),
-            merge_context.project_id.as_str(),
-            merge_context.mr.mr_id.as_str(),
-            job_id,
+            subject.project_id.as_str(),
+            subject.merge_request_id(),
+            owner_id,
             state,
-            merge_context.target_branch.as_str(),
-            merge_context.source_branch.as_str(),
+            subject.target_branch.as_str(),
+            subject.source_branch.as_str(),
             stored_policy,
             authority_decision.as_deref(),
-            detail,
+            detail.as_deref(),
             chrono::Utc::now().timestamp(),
         ],
     )
@@ -165,7 +177,9 @@ pub fn parse_merge_precondition(
 pub(super) struct MergeAttemptJournal<'a> {
     pub attempt_id: &'a str,
     pub project_id: &'a str,
-    pub merge_request_id: &'a str,
+    /// `None` for an operator request's landing, which no merge request
+    /// owns; its rows carry `subject.operatorRequest` in their detail instead.
+    pub merge_request_id: Option<&'a str>,
     pub job_id: &'a str,
     pub target_ref: &'a str,
     pub source_ref: &'a str,
@@ -183,6 +197,57 @@ pub(super) struct JournalEntry {
     pub human_principal_json: Option<String>,
     pub human_appearance_json: Option<String>,
     pub verification_json: Option<String>,
+}
+
+/// The `subject` key every row of an operator request's attempt carries, built
+/// from the attempt's own identity: no merge request, and the request
+/// attempt's id in `job_id`. `None` for a merge request's attempt.
+pub(super) fn operator_request_subject(
+    attempt: &MergeAttemptJournal<'_>,
+) -> Option<serde_json::Value> {
+    attempt.merge_request_id.is_none().then(|| {
+        serde_json::json!({
+            "operatorRequest": {
+                "attemptId": attempt.job_id,
+                "projectId": attempt.project_id,
+                "source": attempt.source_ref,
+                "target": attempt.target_ref,
+            }
+        })
+    })
+}
+
+/// A row's `detail` as the journal stores it. A merge request's is unchanged.
+/// An operator request's always carries `subject` ([`operator_request_subject`])
+/// as its last key, so every reader tells a request row by what it says rather
+/// than by a job lookup that comes back empty. An object detail keeps its own
+/// keys first, so a publication intent still begins `{"publication":`; plain
+/// text becomes its `message`.
+pub(super) fn journal_detail(
+    attempt: &MergeAttemptJournal<'_>,
+    detail: Option<&str>,
+) -> Option<String> {
+    let Some(subject) = operator_request_subject(attempt) else {
+        return detail.map(str::to_string);
+    };
+    let subject_json = subject.to_string();
+    Some(match detail {
+        None => serde_json::json!({ "subject": subject }).to_string(),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(fields)) if fields.contains_key("subject") => {
+                text.to_string()
+            }
+            Ok(serde_json::Value::Object(fields)) if fields.is_empty() => {
+                serde_json::json!({ "subject": subject }).to_string()
+            }
+            Ok(serde_json::Value::Object(_)) => {
+                let open = text.trim_end();
+                let open = &open[..open.len() - 1];
+                format!("{open},\"subject\":{subject_json}}}")
+            }
+            _ => serde_json::json!({ "message": text, "subject": subject }).to_string(),
+        },
+    })
 }
 
 /// Append one event to a merge attempt's immutable journal.
@@ -217,7 +282,7 @@ pub(super) async fn journal_merge_attempt_event(
             entry.human_principal_json.as_deref(),
             entry.human_appearance_json.as_deref(),
             entry.verification_json.as_deref(),
-            entry.detail.as_deref(),
+            journal_detail(attempt, entry.detail.as_deref()).as_deref(),
             chrono::Utc::now().timestamp(),
         ],
     )
@@ -240,7 +305,7 @@ async fn journal_merge_attempt_outcome(
     journal_merge_attempt_terminal(db, attempt, state, detail).await
 }
 
-async fn journal_merge_attempt_terminal(
+pub(super) async fn journal_merge_attempt_terminal(
     db: &LocalDb,
     attempt: MergeAttemptJournal<'_>,
     state: &str,
@@ -423,7 +488,6 @@ pub async fn reconcile_after_merge(
     let repo_path = ctx.mr.repo_path.clone();
     let pr_number = ctx.mr.github_pr_number;
     let default_branch = ctx.default_branch.clone();
-    let resolved_default_branch = resolve_project_default_branch(&repo_path, &default_branch);
     let target_branch = ctx.target_branch.clone();
     let issue_id = ctx.issue_id.clone();
 
@@ -435,27 +499,14 @@ pub async fn reconcile_after_merge(
 
     // 1. Reconcile the user's project checkout FIRST, before the network file
     //    capture below, so the detach window is bounded by store work rather than
-    //    stretched behind a GitHub round-trip. With the export wrapper repairing
-    //    HEAD synchronously at each export this is belt-and-braces, but it also
-    //    bounds any export path the wrapper's pre/post attribution cannot cover.
-    //    Only a real default-branch advance detaches or moves the main checkout;
-    //    a child→integration merge never does, and resetting there only races
-    //    unrelated work.
-    if should_reconcile_main_checkout_after_merge(&target_branch, &resolved_default_branch) {
-        let git = &*orch.services.git;
-        let pull = checkout_reconciliation.pulls_remote();
-        if let Err(e) =
-            reconcile_main_checkout_after_merge(git, &repo_path, &resolved_default_branch, pull)
-        {
-            log::warn!("Failed to reconcile main checkout after merge: {}", e);
-        }
-    } else {
-        log::debug!(
-            "Skipping main checkout reconcile after merge into non-default target '{}' (resolved default '{}')",
-            target_branch,
-            resolved_default_branch
-        );
-    }
+    //    stretched behind a GitHub round-trip.
+    reconcile_project_checkout(
+        &orch,
+        &repo_path,
+        &default_branch,
+        &target_branch,
+        checkout_reconciliation,
+    );
 
     let file_change_job_id = match resolve_file_change_job_id(&db, &owner_id).await {
         Ok(job_id) => job_id,
@@ -568,6 +619,38 @@ pub async fn reconcile_after_merge(
     log::info!("Post-merge reconciliation completed for owner {}", owner_id);
 }
 
+/// Bring the user's project checkout to a landing on `target_branch`. With the
+/// export wrapper repairing HEAD synchronously at each export this is
+/// belt-and-braces, but it also bounds any export path the wrapper's pre/post
+/// attribution cannot cover. Only a real default-branch advance detaches or
+/// moves the main checkout; a child→integration merge never does, and
+/// resetting there only races unrelated work. Shared by every landing on the
+/// default branch, a pull request's or an operator request's.
+pub(super) fn reconcile_project_checkout(
+    orch: &Orchestrator,
+    repo_path: &str,
+    stored_default: &str,
+    target_branch: &str,
+    checkout_reconciliation: CheckoutReconciliation,
+) {
+    let resolved_default_branch = resolve_project_default_branch(repo_path, stored_default);
+    if should_reconcile_main_checkout_after_merge(target_branch, &resolved_default_branch) {
+        let git = &*orch.services.git;
+        let pull = checkout_reconciliation.pulls_remote();
+        if let Err(e) =
+            reconcile_main_checkout_after_merge(git, repo_path, &resolved_default_branch, pull)
+        {
+            log::warn!("Failed to reconcile main checkout after merge: {}", e);
+        }
+    } else {
+        log::debug!(
+            "Skipping main checkout reconcile after merge into non-default target '{}' (resolved default '{}')",
+            target_branch,
+            resolved_default_branch
+        );
+    }
+}
+
 /// Resolve the effective merge method for a PR. Squash is the default shape for
 /// a normal PR landing on the default branch (one commit per PR), but workspace
 /// PRs deliberately preserve their individual commits, so they always force
@@ -617,7 +700,7 @@ fn default_landing_method(
 /// routing and the post-merge checkout reconcile can never disagree with where
 /// worktrees were based — stopping short of trusting the raw DB column the merge
 /// used to read directly.
-fn resolve_project_default_branch(repo_path: &str, stored_default: &str) -> String {
+pub(super) fn resolve_project_default_branch(repo_path: &str, stored_default: &str) -> String {
     crate::config::project_settings::effective_default_branch(
         Some(Path::new(repo_path)),
         Some(stored_default),
@@ -843,7 +926,7 @@ async fn merge_pr_for_job_past_barrier(
     let (journal_state, detail) = gate.journal();
     let attempt_id = journal_policy_gate_event(
         &db,
-        &merge_context,
+        &super::context::LandingSubject::from(&merge_context),
         job_id,
         journal_state,
         &stored_policy,
@@ -874,7 +957,7 @@ async fn merge_pr_for_job_past_barrier(
                         MergeAttemptJournal {
                             attempt_id: &attempt_id,
                             project_id: &merge_context.project_id,
-                            merge_request_id: &merge_context.mr.mr_id,
+                            merge_request_id: Some(&merge_context.mr.mr_id),
                             job_id,
                             target_ref: &merge_context.target_branch,
                             source_ref: &merge_context.source_branch,
@@ -937,7 +1020,7 @@ async fn merge_pr_for_job_past_barrier(
                 MergeAttemptJournal {
                     attempt_id: &attempt_id,
                     project_id: &journal_project_id,
-                    merge_request_id: &journal_merge_request_id,
+                    merge_request_id: Some(&journal_merge_request_id),
                     job_id,
                     target_ref: &journal_target_ref,
                     source_ref: &journal_source_ref,
@@ -1011,7 +1094,7 @@ async fn merge_pr_for_job_past_barrier(
                         attempt: MergeAttemptJournal {
                             attempt_id: &attempt_id,
                             project_id: &journal_project_id,
-                            merge_request_id: &journal_merge_request_id,
+                            merge_request_id: Some(&journal_merge_request_id),
                             job_id,
                             target_ref: &journal_target_ref,
                             source_ref: &journal_source_ref,
@@ -1029,13 +1112,13 @@ async fn merge_pr_for_job_past_barrier(
                 super::default_landing::land_on_default(
                     orch,
                     job_id,
-                    &merge_context,
+                    &super::context::LandingSubject::from(&merge_context),
                     &method,
                     verified_head.as_deref(),
                     &MergeAttemptJournal {
                         attempt_id: &attempt_id,
                         project_id: &journal_project_id,
-                        merge_request_id: &journal_merge_request_id,
+                        merge_request_id: Some(&journal_merge_request_id),
                         job_id,
                         target_ref: &journal_target_ref,
                         source_ref: &journal_source_ref,
@@ -1075,7 +1158,7 @@ async fn merge_pr_for_job_past_barrier(
             &MergeAttemptJournal {
                 attempt_id: &attempt_id,
                 project_id: &journal_project_id,
-                merge_request_id: &journal_merge_request_id,
+                merge_request_id: Some(&journal_merge_request_id),
                 job_id,
                 target_ref: &journal_target_ref,
                 source_ref: &journal_source_ref,
@@ -1205,7 +1288,7 @@ async fn merge_pr_for_job_past_barrier(
         MergeAttemptJournal {
             attempt_id: &attempt_id,
             project_id: &journal_project_id,
-            merge_request_id: &journal_merge_request_id,
+            merge_request_id: Some(&journal_merge_request_id),
             job_id,
             target_ref: &journal_target_ref,
             source_ref: &journal_source_ref,
@@ -1397,7 +1480,7 @@ mod tests {
         ] {
             let attempt_id = journal_policy_gate_event(
                 &db,
-                &context,
+                &super::super::context::LandingSubject::from(&context),
                 "job",
                 "policy_disabled",
                 policy,
@@ -1411,7 +1494,7 @@ mod tests {
                 MergeAttemptJournal {
                     attempt_id: &attempt_id,
                     project_id: "project",
-                    merge_request_id: "mr",
+                    merge_request_id: Some("mr"),
                     job_id: "job",
                     target_ref: "main",
                     source_ref: "feature",
@@ -1461,7 +1544,7 @@ mod tests {
         MergeAttemptJournal {
             attempt_id,
             project_id: "project",
-            merge_request_id: "mr",
+            merge_request_id: Some("mr"),
             job_id: "job",
             target_ref: "main",
             source_ref: "feature",
@@ -1474,7 +1557,7 @@ mod tests {
     async fn landed_attempt(db: &LocalDb, landing: &str) -> (String, PublishedLanding) {
         let attempt_id = journal_policy_gate_event(
             db,
-            &merge_context(false, false),
+            &super::super::context::LandingSubject::from(&merge_context(false, false)),
             "job",
             "policy_disabled",
             DISABLED,
@@ -1679,7 +1762,7 @@ mod tests {
 
         let attempt_id = journal_policy_gate_event(
             &db,
-            &context,
+            &super::super::context::LandingSubject::from(&context),
             "job",
             "policy_unavailable",
             policy,

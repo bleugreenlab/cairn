@@ -158,10 +158,10 @@ impl PublicationBase {
         prepared: &crate::orchestrator::base_advance::preparation::PreparedBranch,
     ) -> Self {
         Self {
-            branch: prepared.relationship.base_branch.clone(),
+            branch: prepared.base_branch().to_string(),
             commit: prepared.base_commit.clone(),
-            declared: prepared.relationship.declared.clone(),
-            default_branch: prepared.relationship.project_default.clone(),
+            declared: prepared.declared_base(),
+            default_branch: prepared.project_default().to_string(),
         }
     }
 }
@@ -750,7 +750,7 @@ pub(crate) async fn capture_revision(
         branch: branch.clone(),
         head_before: prepared.head_before.clone(),
         head_after: prepared.head_after.clone(),
-        base_branch: prepared.relationship.base_branch.clone(),
+        base_branch: prepared.base_branch().to_string(),
         base_commit: prepared.base_commit.clone(),
         git_tree: prepared.tree.clone(),
         advanced: prepared.advanced,

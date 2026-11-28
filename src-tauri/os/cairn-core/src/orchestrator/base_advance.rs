@@ -2400,11 +2400,22 @@ async fn load_live_terminal_leases(
     .await
 }
 
-/// The base-movement follow-up of a landing: for a default base, import
-/// origin's copy and start base checks and service and code-map notices; for
-/// any base, re-point work cut from the merged branch onto the base it merged
-/// into. Branches cut from the base keep their literal heads until their own
-/// next commit, requested check or run, or merge.
+/// A landing that moved `base_branch`, as its follow-ups need it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BaseAdvance<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) base_branch: &'a str,
+    pub(crate) repo_path: &'a str,
+    /// The branch that landed, when work may have been cut from it (a pull
+    /// request's source). `None` for a branch nothing is ever cut from, such
+    /// as an operator request's.
+    pub(crate) merged_branch: Option<&'a str>,
+    /// Who moved the base, for log lines.
+    pub(crate) label: &'a str,
+}
+
+/// The base-movement follow-up of a pull request's landing, through
+/// [`follow_base_advance`].
 async fn reconcile_jj_downstream(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -2412,6 +2423,43 @@ async fn reconcile_jj_downstream(
     base_branch: &str,
     repo_path: &str,
 ) -> Result<(), String> {
+    let label = format!("merged job {}", merged_job.id);
+    follow_base_advance(
+        orch,
+        db,
+        &BaseAdvance {
+            project_id: &merged_job.project_id,
+            base_branch,
+            repo_path,
+            merged_branch: merged_job.branch.as_deref(),
+            label: &label,
+        },
+    )
+    .await
+}
+
+/// The base-movement follow-up of every landing, whoever owns it: for a
+/// default base, import
+/// origin's copy and start base checks and service and code-map notices; for
+/// any base, re-point work cut from the merged branch onto the base it merged
+/// into. Branches cut from the base keep their literal heads until their own
+/// next commit, requested check or run, or merge. It reads no job: a pull
+/// request's merge reaches it through [`notify_downstream_of_base_advance`],
+/// and an operator request's landing calls it directly.
+pub(crate) async fn follow_base_advance(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    advance: &BaseAdvance<'_>,
+) -> Result<(), String> {
+    let BaseAdvance {
+        project_id,
+        base_branch,
+        repo_path,
+        merged_branch,
+        label,
+    } = *advance;
+    #[cfg(test)]
+    follow_probe::record(repo_path, base_branch);
     // The store owns the LOCAL fold, but it does not own what origin did with the
     // pull request. An operator squash-merging on GitHub mints a commit id the
     // store has never seen, so origin moves and the store's local default
@@ -2420,12 +2468,11 @@ async fn reconcile_jj_downstream(
     // the fold and fails for the merge, which is why nearly every merge left the
     // bookmark to conflict. Reconcile before the sibling gate, and fetch first so
     // the commit origin holds is actually in the store to reconcile onto.
-    if branch_is_project_default(db, &merged_job.project_id, base_branch).await {
+    if branch_is_project_default(db, project_id, base_branch).await {
         let repo = Path::new(repo_path);
         if project_has_origin(orch, repo) {
-            let ctx = format!("merged job {}", merged_job.id);
             let record = crate::orchestrator::base_branch_sync::FetchRecord {
-                project_id: &merged_job.project_id,
+                project_id,
                 source: crate::orchestrator::base_branch_sync::Source::Fetch,
             };
             match crate::orchestrator::base_branch_sync::fetch_origin_serialized(
@@ -2442,50 +2489,42 @@ async fn reconcile_jj_downstream(
                     let _ = reconcile_store_default_bookmark(
                         orch,
                         db,
-                        &merged_job.project_id,
+                        project_id,
                         repo,
                         base_branch,
-                        &ctx,
+                        label,
                     )
                     .await;
                 }
                 Err(error) => log::warn!(
-                    "{ctx}: git fetch origin failed; skipping default bookmark reconcile: {error}"
+                    "{label}: git fetch origin failed; skipping default bookmark reconcile: {error}"
                 ),
             }
         }
         crate::execution::checks_main::spawn(
             orch,
-            merged_job.project_id.clone(),
+            project_id.to_string(),
             repo_path.to_string(),
             base_branch.to_string(),
             crate::execution::checks_main::Trigger::Merge,
         );
         // A merged commit that lists live publish targets is published.
-        crate::publications::note_base_advance(orch, &merged_job.project_id);
+        crate::publications::note_base_advance(orch, project_id);
         // The code map projects the base tree, so this merge is exactly what
         // makes the stored one describe a tree that is no longer the base.
         // A service runs its package as it stands at the base tip, so this
         // merge may have changed what one of them should be running.
-        crate::project_services::supervisor::note_base_advance(orch, &merged_job.project_id);
-        crate::projects::codemap::note_base_advance(
-            orch,
-            db,
-            &merged_job.project_id,
-            repo_path,
-            base_branch,
-        )
-        .await;
+        crate::project_services::supervisor::note_base_advance(orch, project_id);
+        crate::projects::codemap::note_base_advance(orch, db, project_id, repo_path, base_branch)
+            .await;
     }
 
     // Anything cut FROM the branch that just merged loses its base the moment
     // that branch is deleted. Re-point it before the sibling set is read, so
     // those children inherit this advance in the same pass instead of being
     // stranded by it.
-    if let Some(merged_branch) = merged_job
-        .branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty() && *branch != base_branch)
+    if let Some(merged_branch) =
+        merged_branch.filter(|branch| !branch.is_empty() && *branch != base_branch)
     {
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
         let _reservation = orch
@@ -2505,24 +2544,45 @@ async fn reconcile_jj_downstream(
             )
             .await
             .map_err(|()| format!("store busy while repointing children of `{merged_branch}`; no relationship was changed"))?;
-        if let Err(error) = repoint_children_of_merged_branch(
-            db,
-            &guard,
-            &merged_job.project_id,
-            merged_branch,
-            base_branch,
-        )
-        .await
+        if let Err(error) =
+            repoint_children_of_merged_branch(db, &guard, project_id, merged_branch, base_branch)
+                .await
         {
             log::warn!(
-                "merged job {}: could not re-point work cut from `{merged_branch}` onto \
-                 `{base_branch}`: {error}",
-                merged_job.id
+                "{label}: could not re-point work cut from `{merged_branch}` onto \
+                 `{base_branch}`: {error}"
             );
         }
     }
 
     Ok(())
+}
+
+/// Which bases [`follow_base_advance`] was run for, by checkout, so a test can
+/// see a landing's follow-ups ran without racing the other tests.
+#[cfg(test)]
+pub(crate) mod follow_probe {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn seen() -> &'static Mutex<HashSet<(String, String)>> {
+        static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+        SEEN.get_or_init(Default::default)
+    }
+
+    pub(super) fn record(repo_path: &str, base_branch: &str) {
+        seen()
+            .lock()
+            .unwrap()
+            .insert((repo_path.to_string(), base_branch.to_string()));
+    }
+
+    pub(crate) fn ran(repo_path: &str, base_branch: &str) -> bool {
+        seen()
+            .lock()
+            .unwrap()
+            .contains(&(repo_path.to_string(), base_branch.to_string()))
+    }
 }
 
 /// Bring the store's local bookmark for the project's default branch back into

@@ -1573,7 +1573,12 @@ pub(super) async fn unsettled_attempts(db: &LocalDb) -> Result<Vec<UnsettledAtte
                             AND NOT EXISTS (SELECT 1 FROM merge_attempt_events p
                                              WHERE p.attempt_id = e.attempt_id
                                                AND p.state = 'executing'
-                                               AND p.detail LIKE '{"publication":%')"#,
+                                               AND p.detail LIKE '{"publication":%')
+                            -- An operator request never takes the approval
+                            -- path, and its attempt id matches no job.
+                            AND NOT EXISTS (SELECT 1 FROM merge_attempt_events r
+                                             WHERE r.attempt_id = e.attempt_id
+                                               AND r.detail LIKE '%"subject":{"operatorRequest":%')"#,
                         (),
                     )
                     .await?;
@@ -1738,7 +1743,7 @@ pub(super) async fn settle_attempt(
         MergeAttemptJournal {
             attempt_id: &attempt.attempt_id,
             project_id: &attempt.project_id,
-            merge_request_id: &attempt.merge_request_id,
+            merge_request_id: Some(&attempt.merge_request_id),
             job_id: &attempt.job_id,
             target_ref: &attempt.target_ref,
             source_ref: &attempt.source_ref,

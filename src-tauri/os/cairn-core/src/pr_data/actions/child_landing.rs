@@ -48,7 +48,7 @@ use crate::orchestrator::landing::bind;
 use crate::orchestrator::{BranchReservation, JjStoreGuard, Orchestrator};
 use crate::storage::LocalDb;
 
-use super::context::MergeMrContext;
+use super::context::{LandingSubject, MergeMrContext};
 use super::default_landing::{
     admit_landing_writers, advance_landing_bookmarks, coordinate_moved, judge_origin_target,
     origin_target_refusal, pin_landing, publish_pinned, recorded_origin_target,
@@ -69,6 +69,8 @@ pub(super) async fn land_on_integration(
     merge_context: &MergeMrContext,
     journal: &MergeAttemptJournal<'_>,
 ) -> Result<DefaultLanding, String> {
+    let subject = LandingSubject::from(merge_context);
+    let merge_context = &subject;
     let source = merge_context.source_branch.as_str();
     let target = merge_context.target_branch.as_str();
     let store = store_of(orch, merge_context);
@@ -93,7 +95,7 @@ pub(super) async fn land_on_integration(
     for attempt in 0..MAX_LANDING_ATTEMPTS {
         super::merge_metrics::landing_attempt();
         reservation_covers(&reservation, &store, merge_context)?;
-        let origin_target = if merge_context.mr.is_local {
+        let origin_target = if merge_context.is_local {
             None
         } else {
             Some(origin_integration(orch, &store, merge_context, &reservation, origin_read).await?)
@@ -210,7 +212,7 @@ pub(super) async fn land_on_integration(
 async fn origin_integration(
     orch: &Orchestrator,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     reservation: &crate::orchestrator::BranchReservation,
     origin_read: OriginRead,
 ) -> Result<OriginIntegration, String> {
@@ -260,7 +262,7 @@ struct OriginIntegration {
 async fn rewrite_evidence(
     orch: &Orchestrator,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
 ) -> Result<Vec<crate::jj::AcceptedAdvanceDrops>, String> {
     let (project, target) = (
         merge_context.project_id.as_str(),
@@ -311,7 +313,7 @@ async fn rewrite_evidence(
 /// the prepared coordinate.
 fn fast_forward_prospect(
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     prepared: &PreparedBranch,
 ) -> Result<ProspectiveMerge, String> {
     let (head, base) = (prepared.head_after.as_str(), prepared.base_commit.as_str());
@@ -354,7 +356,7 @@ async fn validate(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     job_id: &str,
     prospect: &ProspectiveMerge,
 ) -> Result<(), String> {
@@ -376,7 +378,7 @@ async fn validate(
     .await
     .map_err(|error| format!("landing validation did not finish: {error}"))??;
 
-    let repo_path = merge_context.mr.repo_path.as_str();
+    let repo_path = merge_context.repo_path.as_str();
     match crate::execution::checks::verify_review_tree(
         orch,
         db.clone(),
@@ -416,7 +418,7 @@ async fn validate(
 #[allow(clippy::too_many_arguments)]
 async fn land_if_unchanged(
     orch: &Orchestrator,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     store: &Store,
     prepared: &PreparedBranch,
     prospect: &ProspectiveMerge,
@@ -499,7 +501,7 @@ async fn land_if_unchanged(
     };
     // The head is referenced by the source bookmark, but only the pin keeps it
     // alive for recovery if the outcome is unknown and the branch moves on.
-    pin_landing(&merge_context.mr.repo_path, journal.attempt_id, head)?;
+    pin_landing(&merge_context.repo_path, journal.attempt_id, head)?;
     let publication = Publication {
         target_branch: target.to_string(),
         expected_old: origin_target.origin.clone(),

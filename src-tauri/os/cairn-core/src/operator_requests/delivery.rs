@@ -41,6 +41,10 @@ pub(crate) fn spawn(orch: Orchestrator) {
 }
 
 pub(crate) async fn drain_once(orch: &Orchestrator) -> Result<usize, String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    requests::wake_expired_chains(&orch.db.local, now_ms, now_ms / 1000)
+        .await
+        .map_err(|e| e.to_string())?;
     let intents = requests::pending_outbox(&orch.db.local, 256)
         .await
         .map_err(|e| e.to_string())?;
@@ -106,6 +110,7 @@ async fn deliver(orch: &Orchestrator, intent: &RequestOutbox) -> Result<(), Stri
                 )),
             }
         }
+        "chain" => super::chain::process(orch, payload_str(intent, "parent_attempt_id")?).await,
         other => Err(format!("unknown request outbox kind '{other}'")),
     }
 }

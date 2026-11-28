@@ -50,10 +50,10 @@ use crate::orchestrator::base_advance::preparation::PreparedBranch;
 use crate::orchestrator::landing::{self, bind};
 use crate::orchestrator::{BranchReservation, JjStoreGuard, Orchestrator};
 use crate::security::broker::github::installation_authority;
-use crate::storage::LocalDb;
+use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
-use super::context::MergeMrContext;
+use super::context::{LandingSubject, MergeMrContext};
 use super::human_approval::{
     self, approval_strategy, gate_checks, Ceremony, Execution, InFlight, LandedShape,
     LandingEvidence, LandingWorld, Observation, SystemClock,
@@ -65,6 +65,7 @@ use super::landing_record::{
 use super::merge::MergeAttemptJournal;
 use super::store_merge::{
     prepare_landing_source, prepared_landing_holds, prospective_default_landing, ProspectiveMerge,
+    SourceRefusal,
 };
 
 /// How long a landing waits for its source and target to be free of another
@@ -289,7 +290,7 @@ impl Publish {
 /// maintenance is reclaiming, so the landing retries rather than racing it.
 fn object_lease(
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
 ) -> Result<crate::jj::StoreObjectLease, String> {
     crate::jj::StoreObjectLease::for_store(&store.path).map_err(|error| {
         format!(
@@ -305,7 +306,7 @@ fn object_lease(
 pub(super) fn reservation_covers(
     reservation: &BranchReservation,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
 ) -> Result<(), String> {
     for branch in [&merge_context.source_branch, &merge_context.target_branch] {
         if !reservation.covers(&store.path, branch) {
@@ -330,14 +331,13 @@ pub(super) async fn admit_landing_writers(
     orch: &Orchestrator,
     guard: &JjStoreGuard,
     reservation: &BranchReservation,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
 ) -> Result<(), String> {
     // Timed here, not at its callers, so every admission is attributed: the
     // ones the build and the fold run are carved out of those phases.
     let _admission = super::merge_metrics::time(super::merge_metrics::Phase::Admission);
     let started = std::time::Instant::now();
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.repo_path));
     let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
     let fence_db_found = started.elapsed();
     crate::orchestrator::branch_recovery::refuse_if_fenced(
@@ -426,7 +426,7 @@ pub(super) enum PublishRefs {
 async fn publish_released(
     orch: &Orchestrator,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     guard: JjStoreGuard,
     reservation: &BranchReservation,
     publication: &Publication,
@@ -591,7 +591,7 @@ async fn checkpoint_publication(
     guard: &JjStoreGuard,
     reservation: &BranchReservation,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     landing: &str,
 ) -> Option<String> {
     use crate::orchestrator::base_advance::preparation::{
@@ -714,7 +714,7 @@ pub(in crate::pr_data::actions) mod origin_take_barrier {
 /// until they are corrected, rather than landing them into it.
 pub(super) async fn repoint_landed_children(
     orch: &Orchestrator,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     guard: &JjStoreGuard,
 ) -> Result<(), String> {
     let (source, target) = (
@@ -850,6 +850,9 @@ struct Prospect {
 enum Built {
     Ready(Box<Prospect>),
     Moved(String),
+    /// An exact source no longer sits on the target's tip
+    /// (`store_merge::SourceRefusal::BaseMoved`).
+    BaseMoved(String),
 }
 
 pub(super) struct Store {
@@ -857,13 +860,10 @@ pub(super) struct Store {
     pub(super) path: PathBuf,
 }
 
-pub(super) fn store_of(orch: &Orchestrator, merge_context: &MergeMrContext) -> Store {
+pub(super) fn store_of(orch: &Orchestrator, merge_context: &LandingSubject) -> Store {
     Store {
         jj: crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-        path: crate::jj::project_store_dir(
-            &orch.config_dir,
-            Path::new(&merge_context.mr.repo_path),
-        ),
+        path: crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.repo_path)),
     }
 }
 
@@ -872,14 +872,19 @@ pub(super) fn store_of(orch: &Orchestrator, merge_context: &MergeMrContext) -> S
 /// verified head, which must be exactly what lands. `journal` is the merge
 /// call's attempt; each publication try to origin journals under its own
 /// attempt id derived from it.
+///
+/// `owner_id` is whose landing this is, as the journal's `job_id` column
+/// records it under migration 0019's owner convention: the pull request's
+/// owning job, or an operator request's attempt. It reaches nothing but log
+/// lines here.
 pub(super) async fn land_on_default(
     orch: &Orchestrator,
-    job_id: &str,
-    merge_context: &MergeMrContext,
+    owner_id: &str,
+    merge_context: &LandingSubject,
     method: &str,
     verified_head: Option<&str>,
     journal: &MergeAttemptJournal<'_>,
-) -> Result<DefaultLanding, String> {
+) -> Result<DefaultLanding, LandingError> {
     let source = merge_context.source_branch.as_str();
     let target = merge_context.target_branch.as_str();
     let store = store_of(orch, merge_context);
@@ -906,7 +911,7 @@ pub(super) async fn land_on_default(
         super::merge_metrics::landing_attempt();
         let prospect = match prepare_prospect(
             orch,
-            job_id,
+            owner_id,
             merge_context,
             method,
             &store,
@@ -918,23 +923,26 @@ pub(super) async fn land_on_default(
             Built::Ready(prospect) => prospect,
             Built::Moved(moved) => {
                 log::info!(
-                    "landing[{job_id}]: the prepared coordinate of `{source}` moved before its \
+                    "landing[{owner_id}]: the prepared coordinate of `{source}` moved before its \
                      merge result was built (attempt {}): {moved}",
                     attempt + 1
                 );
                 continue;
             }
+            // Not retried: nothing here can carry the source, so another
+            // attempt would find the same shape. The caller seals again.
+            Built::BaseMoved(why) => return Err(LandingError::BaseMoved(why)),
         };
         if let Some(verified) = verified_head {
             // A pin bump lands exactly its verified head: one the preparation
             // carried onto a newer target is a different input, never reused.
             if prospect.binds || prospect.prepared.head_after != verified {
-                return Err(format!(
+                return Err(LandingError::Failed(format!(
                     "Refusing to merge `{source}` as a pin bump: the head that would land is not \
                      the verified head {verified} (the branch moved, or it changes an identifier \
                      the landing binds, which a pin bump never does). Merge again so the new head \
                      is verified."
-                ));
+                )));
             }
         }
 
@@ -991,29 +999,404 @@ pub(super) async fn land_on_default(
                 });
             }
             Attempt::StoreMoved => log::info!(
-                "landing[{job_id}]: `{source}` or `{target}` moved while the landing was \
+                "landing[{owner_id}]: `{source}` or `{target}` moved while the landing was \
                  validated (attempt {}); building and validating the new merge result",
                 attempt + 1
             ),
             Attempt::OriginMoved => log::info!(
-                "landing[{job_id}]: origin's `{target}` was not the copy the landing leased on \
+                "landing[{owner_id}]: origin's `{target}` was not the copy the landing leased on \
                  (attempt {}); reading origin and preparing again",
                 attempt + 1
             ),
         }
     }
-    Err(format!(
+    Err(LandingError::Failed(format!(
         "Refusing to merge `{source}` into `{target}`: `{target}` or the branch kept moving while \
          the landing was validated, {MAX_LANDING_ATTEMPTS} times. `{target}` was not advanced; merge \
          again."
-    ))
+    )))
+}
+
+/// Why [`land_on_default`] landed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LandingError {
+    /// An exact source (a request branch) no longer sits on the target's tip.
+    /// Only its owner can answer that, by sealing again on the new tip.
+    BaseMoved(String),
+    /// Every other refusal or failure, as the merge reports it.
+    Failed(String),
+}
+
+impl From<String> for LandingError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<LandingError> for String {
+    fn from(error: LandingError) -> Self {
+        match error {
+            LandingError::BaseMoved(why) | LandingError::Failed(why) => why,
+        }
+    }
+}
+
+// ─── An operator request's landing ─────────────────────────────────────────────────────────────
+
+/// What an operator request's landing put on the default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestLanding {
+    /// The commit now on the default branch: the sealed commit itself, which
+    /// the landing fast-forwards the target to.
+    pub(crate) landed_commit: String,
+}
+
+/// Why an operator request's commit did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestLandingError {
+    /// The default branch moved after the seal. The consumer discards the
+    /// branch and runs the accepted command again on the new tip.
+    BaseMoved(String),
+    /// The project's base-merge policy does not let an unapproved landing
+    /// onto the base: only `disabled` does.
+    PolicyRefused(String),
+    /// Anything else. Nothing landed.
+    Failed(String),
+}
+
+/// Land an operator request's sealed commit, the one commit on `source_branch`
+/// (`crate::jj::request_branch(attempt_id)`), onto the project's default
+/// branch, through the one landing core and its exact admission
+/// (`store_merge::exact_landing_source`).
+///
+/// The provably-human base-merge policy is read and enforced first: only
+/// `disabled` proceeds, because a request never takes the approval ceremony.
+/// The landing is a fast-forward, so the commit that lands is the sealed
+/// commit with its trailers. It journals under the attempt id, with no merge
+/// request, and writes no merge-request or job row. Once it landed, the
+/// follow-ups every default-branch landing owes run: the project checkout's
+/// repair and [`crate::orchestrator::base_advance::follow_base_advance`].
+pub(crate) async fn land_request_commit(
+    orch: &Orchestrator,
+    project_id: &str,
+    attempt_id: &str,
+    source_branch: &str,
+    title: &str,
+) -> Result<RequestLanding, RequestLandingError> {
+    use super::merge::{
+        enforce_human_base_merge_policy, journal_merge_attempt_terminal, journal_policy_gate_event,
+        BaseMergeGate,
+    };
+    use cairn_db::models::HumanBaseMergePolicyReadState;
+    let failed = RequestLandingError::Failed;
+    if crate::jj::request_attempt_of(source_branch) != Some(attempt_id) {
+        return Err(failed(format!(
+            "`{source_branch}` is not request attempt {attempt_id}'s branch"
+        )));
+    }
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| failed(format!("the project's database is unavailable: {error}")))?;
+    let (repo_path, stored_default, stored_policy) = db
+        .query_opt(
+            "SELECT repo_path, default_branch, human_base_merge_policy FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+        )
+        .await
+        .map_err(|error| failed(format!("the project is unreadable: {error}")))?
+        .ok_or_else(|| failed(format!("project {project_id} is gone")))?;
+    let stored_default = stored_default.unwrap_or_else(|| "main".to_string());
+    let stored_policy = stored_policy.ok_or_else(|| {
+        RequestLandingError::PolicyRefused(
+            "Refusing to land: the project's provably-human merge policy is unavailable."
+                .to_string(),
+        )
+    })?;
+    let default_branch = super::merge::resolve_project_default_branch(&repo_path, &stored_default);
+    let subject = LandingSubject {
+        project_id: project_id.to_string(),
+        repo_path: repo_path.clone(),
+        // The rule a pull request's `is_local` is recorded by when it opens.
+        is_local: !crate::mcp::git::has_remote(Path::new(&repo_path)),
+        source_branch: source_branch.to_string(),
+        target_branch: default_branch.clone(),
+        default_branch: default_branch.clone(),
+        issue_id: None,
+        title: title.to_string(),
+        journal: super::context::LandingJournal::OperatorRequest {
+            attempt_id: attempt_id.to_string(),
+        },
+    };
+    let gate = enforce_human_base_merge_policy(
+        &HumanBaseMergePolicyReadState::from_stored(&stored_policy),
+        true,
+    );
+    let (state, detail) = gate.journal();
+    let merge_attempt = journal_policy_gate_event(
+        &db,
+        &subject,
+        attempt_id,
+        state,
+        &stored_policy,
+        None,
+        detail,
+    )
+    .await
+    .map_err(failed)?;
+    let journal = MergeAttemptJournal {
+        attempt_id: &merge_attempt,
+        project_id,
+        merge_request_id: None,
+        job_id: attempt_id,
+        target_ref: &default_branch,
+        source_ref: source_branch,
+        policy_json: &stored_policy,
+    };
+    let terminal = |state: &'static str, detail: String| {
+        let db = db.clone();
+        async move {
+            if let Err(error) =
+                journal_merge_attempt_terminal(&db, journal, state, Some(&detail)).await
+            {
+                log::warn!("request landing {attempt_id}: its outcome was not journaled: {error}");
+            }
+        }
+    };
+    let refused = match gate {
+        BaseMergeGate::Disabled => None,
+        BaseMergeGate::Unavailable(refusal) => Some(refusal),
+        BaseMergeGate::RequiresHumanApproval { .. } => Some(
+            "Refusing to land: the project requires provably-human approval to merge into its \
+             base branch, and an operator request never takes that ceremony. Disable the policy \
+             to land approved commands."
+                .to_string(),
+        ),
+        BaseMergeGate::NotApplicable => Some("a request always lands on the base".to_string()),
+    };
+    if let Some(refusal) = refused {
+        terminal("failed", refusal.clone()).await;
+        return Err(RequestLandingError::PolicyRefused(refusal));
+    }
+    if let Err(error) = crate::pr_data::helpers::assert_main_checkout_clean_for_default_merge(
+        &*orch.services.git,
+        &repo_path,
+    ) {
+        terminal("failed", error.clone()).await;
+        return Err(failed(error));
+    }
+    let mut landing =
+        match land_on_default(orch, attempt_id, &subject, "merge", None, &journal).await {
+            Ok(landing) => landing,
+            Err(LandingError::BaseMoved(why)) => {
+                terminal("failed", why.clone()).await;
+                return Err(RequestLandingError::BaseMoved(why));
+            }
+            Err(LandingError::Failed(error)) => {
+                terminal("failed", error.clone()).await;
+                return Err(failed(error));
+            }
+        };
+    let Some(landed_commit) = landing.landed_commit.clone() else {
+        terminal(
+            "failed",
+            "the landing reported no landed commit".to_string(),
+        )
+        .await;
+        return Err(failed("the landing reported no landed commit".to_string()));
+    };
+    // No merge request records this landing: the publication's own journal
+    // does. One whose local recording is still pending stays `executing`, so
+    // landing recovery finishes it (`landing_record::settle_publication`'s
+    // request arm).
+    if let Some(published) = landing.published.take() {
+        if published.recording_pending.is_none() {
+            let publication_journal = MergeAttemptJournal {
+                attempt_id: &published.attempt_id,
+                ..journal
+            };
+            if let Err(error) = super::landing_record::journal_publication_outcome(
+                &db,
+                &publication_journal,
+                &published.publication,
+                &PublicationOutcome::Accepted { detail: None },
+            )
+            .await
+            {
+                log::warn!(
+                    "request landing {attempt_id}: publication outcome not journaled: {error}"
+                );
+            }
+        }
+    }
+    terminal(
+        "succeeded",
+        serde_json::json!({ "landedCommit": landed_commit }).to_string(),
+    )
+    .await;
+    landing.reservation = None;
+    after_default_landing(
+        orch,
+        &db,
+        &subject,
+        &stored_default,
+        &format!("operator request {attempt_id}"),
+    )
+    .await;
+    Ok(RequestLanding { landed_commit })
+}
+
+/// The follow-ups a landing on the default branch owes, with nothing about an
+/// issue or a merge request: the project checkout is brought to it, then the
+/// base-advance follow-ups run (origin import and default-bookmark reconcile,
+/// main-cadence checks, publication, service and code-map notices).
+async fn after_default_landing(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    subject: &LandingSubject,
+    stored_default: &str,
+    label: &str,
+) {
+    super::merge::reconcile_project_checkout(
+        orch,
+        &subject.repo_path,
+        stored_default,
+        &subject.target_branch,
+        super::merge::CheckoutReconciliation::RepairLocalFold,
+    );
+    let advance = crate::orchestrator::base_advance::BaseAdvance {
+        project_id: &subject.project_id,
+        base_branch: &subject.target_branch,
+        repo_path: &subject.repo_path,
+        merged_branch: None,
+        label,
+    };
+    if let Err(error) =
+        crate::orchestrator::base_advance::follow_base_advance(orch, db, &advance).await
+    {
+        log::warn!("{label}: the base-advance follow-ups did not complete: {error}");
+    }
+}
+
+/// Retire a request branch once its commit landed: only while the branch is
+/// exactly `landed_commit` and that commit is on `target`, under the branch's
+/// reservation, the store lock and its write permit. A request branch is never
+/// pushed, so its local copies are all there is.
+pub(crate) async fn retire_request_branch(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    target: &str,
+    landed_commit: &str,
+) -> Result<(), String> {
+    let (jj, target, landed) = (
+        crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        target.to_string(),
+        landed_commit.to_string(),
+    );
+    let name = branch.to_string();
+    end_request_branch(
+        orch,
+        project_id,
+        branch,
+        "retire a landed request branch",
+        move |store| {
+            let state = crate::jj::read_local_branch_state(store, &name)?;
+            if state.bookmark.as_deref() != Some(landed.as_str())
+                || !crate::jj::bookmark_landed_in(&jj, store, &name, &target)
+            {
+                return Ok(crate::jj::Retirement::Refused(format!(
+                "`{name}` is not exactly its landed commit {landed} on `{target}` (it is at {:?})",
+                state.bookmark
+            )));
+            }
+            crate::jj::retire_bookmark_expecting(store, &name, &state)
+        },
+    )
+    .await
+}
+
+/// Discard a request branch whose commit did not land (the base moved, or the
+/// attempt failed after its seal), while it is still exactly `expected_head`
+/// and that head carries this attempt's trailer
+/// (`crate::jj::discard_unlanded_bookmark_expecting`).
+pub(crate) async fn discard_request_branch(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    expected_head: &str,
+) -> Result<(), String> {
+    let (name, head) = (branch.to_string(), expected_head.to_string());
+    end_request_branch(
+        orch,
+        project_id,
+        branch,
+        "discard an unlanded request branch",
+        move |store| crate::jj::discard_unlanded_bookmark_expecting(store, &name, &head),
+    )
+    .await
+}
+
+/// End a request branch's life with `end`, under the branch's reservation, the
+/// store lock, the store's object lease and the branch's write permit.
+async fn end_request_branch(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    what: &str,
+    end: impl FnOnce(&Path) -> Result<crate::jj::Retirement, String>,
+) -> Result<(), String> {
+    if !crate::jj::is_request_branch(branch) {
+        return Err(format!(
+            "refusing to {what}: `{branch}` is not a request branch"
+        ));
+    }
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| format!("the project's database is unavailable: {error}"))?;
+    let repo_path = db
+        .query_opt_text(
+            "SELECT repo_path FROM projects WHERE id = ?1",
+            params![project_id],
+        )
+        .await
+        .map_err(|error| format!("the project is unreadable: {error}"))?
+        .ok_or_else(|| format!("project {project_id} is gone"))?;
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+    let reservation = orch
+        .reserve_branches(&store, &[branch], what, LANDING_RESERVATION_WAIT)
+        .await?;
+    let guard = orch
+        .acquire_jj_store_lock(
+            &store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            format!("{what}: {branch}"),
+        )
+        .await;
+    let _lease = crate::jj::StoreObjectLease::for_store(&store)?;
+    let _permit = guard
+        .branch_write_permit(
+            &db,
+            &reservation,
+            project_id,
+            branch,
+            crate::orchestrator::BatchAdmission::None,
+        )
+        .await
+        .map_err(|refusal| refusal.to_string())?;
+    match guard.blocking_phase("end a request branch", || end(&store))? {
+        crate::jj::Retirement::Retired => Ok(()),
+        crate::jj::Retirement::Refused(why) | crate::jj::Retirement::Partial(why) => {
+            Err(format!("`{branch}` was not ended ({what}): {why}"))
+        }
+    }
 }
 
 /// Validate a prospect off the store lock: every changed file parses, and
 /// every bound identifier holds its invariant.
 async fn validate_prospect(
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     prospect: &Prospect,
 ) -> Result<(), String> {
     let _validate = super::merge_metrics::time(super::merge_metrics::Phase::Validate);
@@ -1060,8 +1443,8 @@ async fn validate_prospect(
 /// a remote reads origin's target first or may lease on the store's record.
 async fn prepare_prospect(
     orch: &Orchestrator,
-    job_id: &str,
-    merge_context: &MergeMrContext,
+    owner_id: &str,
+    merge_context: &LandingSubject,
     method: &str,
     store: &Store,
     reservation: &Arc<BranchReservation>,
@@ -1069,7 +1452,7 @@ async fn prepare_prospect(
 ) -> Result<Built, String> {
     let source = merge_context.source_branch.as_str();
     reservation_covers(reservation, store, merge_context)?;
-    if !merge_context.mr.is_local {
+    if !merge_context.is_local {
         let recorded = match origin_read {
             OriginRead::Recorded => {
                 recorded_origin_target(store, &merge_context.target_branch).await
@@ -1078,14 +1461,18 @@ async fn prepare_prospect(
         };
         match recorded {
             Some(recorded) => log::debug!(
-                "landing[{job_id}]: the store's `{}` is its recorded copy of origin's ({recorded}); \
+                "landing[{owner_id}]: the store's `{}` is its recorded copy of origin's ({recorded}); \
                  leasing on it without a fetch",
                 merge_context.target_branch
             ),
             None => take_origin_target(orch, store, merge_context, reservation).await?,
         }
     }
-    let prepared = prepare_landing_source(orch, job_id, merge_context, reservation).await?;
+    let prepared = match prepare_landing_source(orch, owner_id, merge_context, reservation).await {
+        Ok(prepared) => prepared,
+        Err(SourceRefusal::BaseMoved(why)) => return Ok(Built::BaseMoved(why)),
+        Err(SourceRefusal::Refused(error)) => return Err(error),
+    };
     let wait = super::merge_metrics::time(super::merge_metrics::Phase::LockWait);
     let guard = orch
         .acquire_jj_store_lock(
@@ -1116,7 +1503,7 @@ async fn prepare_prospect(
 pub(super) async fn take_origin_target(
     orch: &Orchestrator,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     reservation: &BranchReservation,
 ) -> Result<(), String> {
     let taken = judge_origin_target(orch, store, merge_context, reservation).await?;
@@ -1137,7 +1524,7 @@ pub(super) async fn take_origin_target(
                 orch,
                 &merge_context.project_id,
                 &merge_context.target_branch,
-                &merge_context.mr.mr_id,
+                merge_context.record_id(),
             );
         }
         return Err(origin_target_refusal(
@@ -1199,7 +1586,7 @@ pub(super) struct OriginTarget {
 }
 
 /// The refusal of a landing because of what origin's copy of its target is.
-pub(super) fn origin_target_refusal(merge_context: &MergeMrContext, why: String) -> String {
+pub(super) fn origin_target_refusal(merge_context: &LandingSubject, why: String) -> String {
     let (source, target) = (
         merge_context.source_branch.as_str(),
         merge_context.target_branch.as_str(),
@@ -1216,7 +1603,7 @@ pub(super) fn origin_target_refusal(merge_context: &MergeMrContext, why: String)
 pub(super) async fn judge_origin_target(
     orch: &Orchestrator,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     reservation: &BranchReservation,
 ) -> Result<OriginTarget, String> {
     let (source, target) = (
@@ -1229,7 +1616,7 @@ pub(super) async fn judge_origin_target(
     // the landing learned and when.
     let observed = crate::orchestrator::base_branch_sync::fetch_origin_observation_serialized(
         orch,
-        Path::new(&merge_context.mr.repo_path),
+        Path::new(&merge_context.repo_path),
         target,
         crate::orchestrator::base_branch_sync::FetchRecord {
             project_id: &merge_context.project_id,
@@ -1326,7 +1713,7 @@ pub(super) async fn judge_origin_target(
 /// store lock.
 pub(super) fn coordinate_moved(
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     prepared: &PreparedBranch,
 ) -> Option<String> {
     let (source, target) = (
@@ -1355,7 +1742,7 @@ pub(super) fn coordinate_moved(
 /// the store lock and has checked the source bookmark at the prepared head.
 fn bind_prepared(
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     prepared: &PreparedBranch,
     rules: &[(String, IdentifierRule)],
 ) -> Result<bind::BindPlan, String> {
@@ -1389,7 +1776,7 @@ fn bind_prepared(
 /// publishing a live operation or changing refs. The caller holds the store lock.
 async fn build_prospect(
     orch: &Orchestrator,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     method: &str,
     store: &Store,
     prepared: PreparedBranch,
@@ -1493,7 +1880,7 @@ fn publication_shape(method: &str) -> PublicationShape {
 #[allow(clippy::too_many_arguments)] // the eight are one landing's coordinate set; bundling them would churn the import's hottest file
 async fn land_if_unchanged(
     orch: &Orchestrator,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     method: &str,
     store: &Store,
     prospect: &Prospect,
@@ -1516,7 +1903,7 @@ async fn land_if_unchanged(
     admit_landing_writers(orch, &guard, reservation, merge_context).await?;
     drop(recheck);
     let commit = prospect.merge.commit_id.clone();
-    if merge_context.mr.is_local {
+    if merge_context.is_local {
         // The immutable candidate has not moved either live coordinate.
         let db =
             crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
@@ -1569,7 +1956,7 @@ async fn land_if_unchanged(
     }
 
     // Pin the detached object for transport; live coordinates remain prepared.
-    let repo_path = merge_context.mr.repo_path.as_str();
+    let repo_path = merge_context.repo_path.as_str();
     pin_landing(repo_path, journal.attempt_id, &commit)?;
     let publication = Publication {
         target_branch: merge_context.target_branch.clone(),
@@ -1611,7 +1998,7 @@ async fn land_if_unchanged(
 pub(super) async fn publish_pinned(
     orch: &Orchestrator,
     store: &Store,
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     guard: JjStoreGuard,
     reservation: &BranchReservation,
     journal: &MergeAttemptJournal<'_>,
@@ -1619,7 +2006,7 @@ pub(super) async fn publish_pinned(
     refs: PublishRefs,
 ) -> Result<Attempt, String> {
     let source = merge_context.source_branch.as_str();
-    let repo_path = merge_context.mr.repo_path.as_str();
+    let repo_path = merge_context.repo_path.as_str();
     let commit = publication.landing_commit.clone();
     let journaling = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
     let db = crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
@@ -1793,7 +2180,7 @@ pub(super) async fn land_on_default_with_approval(
 struct GatedLanding<'a> {
     orch: &'a Orchestrator,
     job_id: &'a str,
-    merge_context: &'a MergeMrContext,
+    merge_context: LandingSubject,
     method: &'a str,
     store: Store,
     owner: String,
@@ -1822,9 +2209,9 @@ impl<'a> GatedLanding<'a> {
         Ok(Self {
             orch,
             job_id,
-            merge_context,
+            merge_context: LandingSubject::from(merge_context),
             method,
-            store: store_of(orch, merge_context),
+            store: store_of(orch, &LandingSubject::from(merge_context)),
             owner,
             repo,
             prospect: None,
@@ -1834,7 +2221,7 @@ impl<'a> GatedLanding<'a> {
     }
 
     fn remote(&self) -> bool {
-        !self.merge_context.mr.is_local
+        !self.merge_context.is_local
     }
 }
 
@@ -1899,7 +2286,7 @@ impl LandingWorld for GatedLanding<'_> {
         let reservation = Arc::new(reservation);
         // Protect only this computation. Approval waiting retains neither a
         // reclamation lease nor writer authority; execute computes again.
-        let _lease = object_lease(&self.store, self.merge_context)?;
+        let _lease = object_lease(&self.store, &self.merge_context)?;
         let mut prospect = None;
         for attempt in 0..MAX_LANDING_ATTEMPTS {
             super::merge_metrics::landing_attempt();
@@ -1908,7 +2295,7 @@ impl LandingWorld for GatedLanding<'_> {
             match prepare_prospect(
                 self.orch,
                 self.job_id,
-                self.merge_context,
+                &self.merge_context,
                 self.method,
                 &self.store,
                 &reservation,
@@ -1925,6 +2312,7 @@ impl LandingWorld for GatedLanding<'_> {
                      {moved}",
                     attempt + 1
                 ),
+                Built::BaseMoved(why) => return Err(why),
             }
         }
         drop(reservation);
@@ -1934,11 +2322,11 @@ impl LandingWorld for GatedLanding<'_> {
                  {MAX_LANDING_ATTEMPTS} times; nothing was asked or landed"
             )
         })?;
-        validate_prospect(&self.store, self.merge_context, &prospect).await?;
+        validate_prospect(&self.store, &self.merge_context, &prospect).await?;
         // Judged on the merge result the approval binds; execute lands exactly
         // that tree or refuses.
         self.config_notice = super::config_preflight::preflight_landing_config(
-            self.merge_context,
+            &self.merge_context,
             &prospect.prepared.base_commit,
             &prospect.merge.commit_id,
         )
@@ -2027,7 +2415,7 @@ impl LandingWorld for GatedLanding<'_> {
             Err(error) => return Execution::Refused(error),
         };
         let reservation = Arc::new(reservation);
-        let _lease = match object_lease(store, self.merge_context) {
+        let _lease = match object_lease(store, &self.merge_context) {
             Ok(lease) => lease,
             Err(error) => return Execution::Refused(error),
         };
@@ -2045,14 +2433,18 @@ impl LandingWorld for GatedLanding<'_> {
         // The approval binds the prepared coordinate: it must still hold in
         // full (source, target and the relationship). Origin's target is held
         // to it by the publication's lease.
-        let moved = coordinate_moved(store, self.merge_context, &prospect.prepared);
-        let holds =
-            match prepared_landing_holds(self.orch, self.merge_context, &prospect.prepared, &guard)
-                .await
-            {
-                Ok(holds) => holds,
-                Err(error) => return Execution::Refused(error),
-            };
+        let moved = coordinate_moved(store, &self.merge_context, &prospect.prepared);
+        let holds = match prepared_landing_holds(
+            self.orch,
+            &self.merge_context,
+            &prospect.prepared,
+            &guard,
+        )
+        .await
+        {
+            Ok(holds) => holds,
+            Err(error) => return Execution::Refused(error),
+        };
         if moved.is_some()
             || !holds
             || approved.source_oid != prospect.prepared.head_after
@@ -2071,7 +2463,7 @@ impl LandingWorld for GatedLanding<'_> {
         // than depending on an unattached object surviving that wait.
         let prospect = match build_prospect(
             self.orch,
-            self.merge_context,
+            &self.merge_context,
             self.method,
             store,
             prospect.prepared.clone(),
@@ -2088,7 +2480,7 @@ impl LandingWorld for GatedLanding<'_> {
                     observed: serde_json::json!({ "resultTreeOid": prospect.merge.tree_hash }),
                 }
             }
-            Ok(Built::Moved(moved)) => {
+            Ok(Built::Moved(moved) | Built::BaseMoved(moved)) => {
                 return Execution::BoundStateChanged {
                     observed: serde_json::json!({ "moved": moved }),
                 }
@@ -2131,7 +2523,7 @@ impl LandingWorld for GatedLanding<'_> {
         let publication_journal = MergeAttemptJournal {
             attempt_id: &publication_id,
             project_id: &self.merge_context.project_id,
-            merge_request_id: &self.merge_context.mr.mr_id,
+            merge_request_id: self.merge_context.merge_request_id(),
             job_id: self.job_id,
             target_ref: target,
             source_ref: source,
@@ -2184,27 +2576,28 @@ impl LandingWorld for GatedLanding<'_> {
             if let Err(error) = installed {
                 return Execution::Refused(error);
             }
-            if let Err(error) = repoint_landed_children(self.orch, self.merge_context, &guard).await
+            if let Err(error) =
+                repoint_landed_children(self.orch, &self.merge_context, &guard).await
             {
                 log::warn!("approval landing: {error}");
             }
             return landed(commit, reservation, None);
         }
         // Pin the immutable candidate; both live refs still name preparation.
-        let repo_path = self.merge_context.mr.repo_path.as_str();
+        let repo_path = self.merge_context.repo_path.as_str();
         if let Err(error) = pin_landing(repo_path, self.attempt_id, &commit) {
             return Execution::Refused(error);
         }
         // The exact publication intent also keeps recording failure recoverable
         // after the ceremony itself has truthfully settled the transport.
-        if let Err(error) = reservation_covers(&reservation, store, self.merge_context) {
+        if let Err(error) = reservation_covers(&reservation, store, &self.merge_context) {
             unpin_landing(repo_path, self.attempt_id);
             return Execution::Refused(error);
         }
         let (guard, publish) = publish_released(
             self.orch,
             store,
-            self.merge_context,
+            &self.merge_context,
             guard,
             &reservation,
             &publication,
@@ -2397,7 +2790,7 @@ async fn landing_evidence(
     // The store fold runs in this process under the store lock and its jj
     // operation is atomic, so once no call is driving it the target either
     // advanced with this attempt's fold or did not.
-    let store = store_of(orch, &context);
+    let store = store_of(orch, &LandingSubject::from(&context));
     let Some(tip) = crate::jj::bookmark_commit(&store.jj, &store.path, &context.target_branch)
     else {
         return LandingEvidence::Unknown("the target bookmark is unreadable".to_string());

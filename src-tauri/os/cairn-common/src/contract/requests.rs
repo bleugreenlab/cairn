@@ -10,7 +10,7 @@ pub(crate) const REQUESTS_CONTRACT: ResourceContract = ResourceContract {
     description: "Durable requests on this install. Filing returns immediately and joins equal open requests. Origin and wake destination come from the authenticated live run, never the payload. Known kinds without a registered consumer refuse by name before creating work. Acceptance and decline are operator-proven desktop commands, not resource mutations.",
     read_projections: &[
         ProjectionSpec { key: "status", values: "open | accepted | acting | done | failed | declined | withdrawn" },
-        ProjectionSpec { key: "kind", values: "rebuild | bump_version | lift_drain" },
+        ProjectionSpec { key: "kind", values: "rebuild | lift_drain" },
         ProjectionSpec { key: "requester", values: "canonical requester origin URI" },
         ProjectionSpec { key: "waiting", values: "canonical waiting issue or thread URI" },
         ProjectionSpec { key: "offset", values: "requests skipped in recent update order (default 0)" },
@@ -21,7 +21,7 @@ pub(crate) const REQUESTS_CONTRACT: ResourceContract = ResourceContract {
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
         required: &[
-            KeySpec::new("kind", KeyType::Str, "rebuild | bump_version | lift_drain"),
+            KeySpec::new("kind", KeyType::Str, "rebuild | lift_drain"),
             KeySpec::new("rationale", KeyType::Str, "nonblank requester rationale; untrusted content"),
             KeySpec::new("waiting", KeyType::Array, "canonical issue or thread URIs"),
         ],

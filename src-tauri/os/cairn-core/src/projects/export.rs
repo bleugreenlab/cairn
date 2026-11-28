@@ -183,6 +183,7 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
     ("request_facts", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
     ("request_outbox", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
     ("request_report_receipts", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_chains", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
     (
         "ci_logs_cache",
         "its run_id is a GitHub Actions run id, not a Cairn run; a refetchable cache of CI logs",

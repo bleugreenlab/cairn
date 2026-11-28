@@ -44,6 +44,10 @@ pub(crate) use create_pr::{
     DEFERRED_PR_SYNC_PENDING,
 };
 pub use default_landing::reconcile_approved_merges;
+pub(crate) use default_landing::{
+    discard_request_branch, land_request_commit, retire_request_branch, RequestLandingError,
+};
+pub(crate) use landing_record::request_publication_pending;
 pub use landing_record::{
     reconcile_pending_landings, settle_github_after_landing, GitHubSettlement, LandingRecovery,
 };

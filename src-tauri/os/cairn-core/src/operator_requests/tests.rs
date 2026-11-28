@@ -331,11 +331,7 @@ async fn file_rebuild(orch: &Orchestrator, run: &str, rationale: &str) -> Operat
 #[tokio::test]
 async fn production_unavailable_refuses_filing_and_acceptance_without_authorizing() {
     let mut orch = fixture().await;
-    for kind in [
-        RequestKind::Rebuild,
-        RequestKind::BumpVersion,
-        RequestKind::LiftDrain,
-    ] {
+    for kind in [RequestKind::Rebuild, RequestKind::LiftDrain] {
         let e = file(&orch, &callback("run"), input(kind, Some("sm"), "need it"))
             .await
             .unwrap_err();
@@ -474,140 +470,23 @@ async fn displayed_candidate_is_pinned_but_join_and_fact_refresh_invalidate_the_
 }
 
 #[tokio::test]
-async fn bump_request_refuses_human_only_base_merge_policy() {
+async fn landing_policy_refuses_unless_base_merge_policy_is_disabled() {
+    use fenced_command::declared::landing_policy;
     let orch = fixture().await;
-    register(&orch, RequestKind::BumpVersion);
     policy(&orch, true).await;
-    let ask = || input(RequestKind::BumpVersion, Some("sm"), "bump");
-    let error = file(&orch, &callback("run"), ask()).await.unwrap_err();
+    let error = landing_policy(&orch, "project", "bump").await.unwrap_err();
     assert!(
-        error.contains("bump_version")
+        error.contains("'bump'")
             && error.contains("human_base_merge_policy")
             && error.contains("provably-human"),
         "{error}"
     );
-    assert!(list(&orch, RequestFilter::default())
-        .await
-        .unwrap()
-        .is_empty());
-    policy(&orch, false).await;
-    let card = file(&orch, &callback("run"), ask()).await.unwrap().request;
-    policy(&orch, true).await;
-    assert!(accept_card(&orch, &card)
+    assert!(landing_policy(&orch, " ", "bump")
         .await
         .unwrap_err()
-        .contains("human_base_merge_policy"));
-    assert!(get(&orch, &card.id)
-        .await
-        .unwrap()
-        .unwrap()
-        .attempts
-        .is_empty());
+        .contains("cannot be identified"));
     policy(&orch, false).await;
-    let accepted = accept_card(&orch, &card).await.unwrap();
-    policy(&orch, true).await;
-    let event = &accepted.attempts[0].authorization_event_id;
-    assert!(dispatch_accepted(&orch, event)
-        .await
-        .unwrap_err()
-        .contains("human_base_merge_policy"));
-    let reopened = get(&orch, &card.id).await.unwrap().unwrap();
-    assert_eq!(reopened.state, RequestState::Open);
-    assert_gate(&orch, &reopened, "accepted", true).await;
-    assert_gate(&orch, &reopened, "done", false).await;
-    policy(&orch, false).await;
-    assert!(dispatch_accepted(&orch, event).await.is_err());
-    let fresh = accept_card(&orch, &reopened).await.unwrap();
-    assert!(fresh
-        .attempts
-        .iter()
-        .any(|a| a.state == RequestState::Accepted && a.authorization_event_id != *event));
-}
-
-#[tokio::test]
-async fn policy_enabled_after_claim_blocks_live_recheck_but_allows_failure_reporting() {
-    let orch = fixture().await;
-    let consumer = register(&orch, RequestKind::BumpVersion);
-    let card = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("sm"), "bump"),
-    )
-    .await
-    .unwrap()
-    .request;
-    let accepted = accept_card(&orch, &card).await.unwrap();
-    dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
-        .await
-        .unwrap();
-    let context = consumer.context();
-    policy(&orch, true).await;
-    assert!(context
-        .recheck(&orch)
-        .await
-        .unwrap_err()
-        .contains("human_base_merge_policy"));
-    context
-        .report(
-            &orch,
-            "policy-refusal",
-            report(RequestAttemptOutcome::Failed, true, true),
-        )
-        .await
-        .unwrap();
-    let failed = get(&orch, &card.id).await.unwrap().unwrap();
-    assert_eq!(failed.state, RequestState::Open);
-    assert!(failed.fulfilled_by_attempt.is_none());
-    assert!(failed
-        .requesters
-        .iter()
-        .all(|c| c.satisfied_by_attempt.is_none()));
-    assert_eq!(
-        failed.attempts[0].outcome,
-        Some(RequestAttemptOutcome::Failed)
-    );
-}
-
-#[tokio::test]
-async fn bump_tiers_and_explicit_minimums_coalesce_without_reduction_and_stale_target_refuses() {
-    let orch = fixture().await;
-    let consumer = register(&orch, RequestKind::BumpVersion);
-    let large = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("lg"), "major"),
-    )
-    .await
-    .unwrap();
-    let smaller = file(
-        &orch,
-        &callback("thread-run"),
-        input(RequestKind::BumpVersion, Some("1.2.9"), "explicit"),
-    )
-    .await
-    .unwrap();
-    assert!(!smaller.created);
-    assert_eq!(large.request.id, smaller.request.id);
-    assert_eq!(smaller.request.target.as_deref(), Some("2.0.0"));
-    assert_eq!(
-        smaller
-            .request
-            .requesters
-            .iter()
-            .map(|r| r.minimum_target.as_deref().unwrap())
-            .collect::<std::collections::BTreeSet<_>>(),
-        ["1.2.9", "2.0.0"].into_iter().collect()
-    );
-    consumer.facts.lock().unwrap().running_version = Some("2.0.0".into());
-    let e = accept_card(&orch, &smaller.request).await.unwrap_err();
-    assert!(
-        e.contains("stale") && e.contains("No implicit extra bump"),
-        "{e}"
-    );
-    assert_eq!(
-        get(&orch, &large.request.id).await.unwrap().unwrap().state,
-        RequestState::Open
-    );
+    landing_policy(&orch, "project", "bump").await.unwrap();
 }
 
 #[tokio::test]
@@ -681,7 +560,7 @@ async fn checked_lifecycle_rejects_duplicate_claim_missing_record_and_replayed_c
         let mut wrong = consumer.context();
         match field {
             "commit" => wrong.acceptance.candidate_commit = Some(commit('c')),
-            "kind" => wrong.acceptance.kind = RequestKind::BumpVersion,
+            "kind" => wrong.acceptance.kind = RequestKind::LiftDrain,
             "actor" => wrong.acceptance.actor_id = "other.actor".into(),
             "target" => wrong.acceptance.target = Some("2.0.0".into()),
             "install" => wrong.acceptance.install_id = "other-install".into(),
@@ -857,98 +736,6 @@ fn waiting_uris_reject_resources_and_noncanonical_addresses_and_deduplicate() {
 }
 
 #[tokio::test]
-async fn bump_report_fulfills_only_proven_open_rebuild_contributions_without_fake_acceptance() {
-    let orch = fixture().await;
-    let rebuild = register(&orch, RequestKind::Rebuild);
-    let bump = register(&orch, RequestKind::BumpVersion);
-    rebuild.facts.lock().unwrap().main_commit = Some(commit('c'));
-    let mut first = input(RequestKind::Rebuild, None, "covered a");
-    first.requirements.commits = vec![commit('a')];
-    let r = file(&orch, &callback("run"), first).await.unwrap().request;
-    let mut second = input(RequestKind::Rebuild, None, "not covered c");
-    second.requirements.commits = vec![commit('c')];
-    file(&orch, &callback("thread-run"), second).await.unwrap();
-    let b = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("sm"), "bump and rebuild"),
-    )
-    .await
-    .unwrap()
-    .request;
-    let accepted = accept_card(&orch, &b).await.unwrap();
-    dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
-        .await
-        .unwrap();
-    let context = bump.context();
-    for _ in 0..2 {
-        let mut verified = report(RequestAttemptOutcome::Done, true, true);
-        verified.built_commit = Some(commit('b'));
-        context
-            .report(&orch, "bump-built-b", verified)
-            .await
-            .unwrap();
-    }
-    let mut conflicting = report(RequestAttemptOutcome::Done, true, true);
-    conflicting.document = json!({"verified":true, "changedEvidence":true});
-    assert!(context
-        .report(&orch, "bump-built-b", conflicting)
-        .await
-        .is_err());
-    let partial = get(&orch, &r.id).await.unwrap().unwrap();
-    assert_eq!(partial.state, RequestState::Open);
-    assert!(partial.attempts.is_empty());
-    assert!(partial.current_attempt.is_none());
-    assert_eq!(
-        partial
-            .requesters
-            .iter()
-            .find(|c| c.rationale == "covered a")
-            .unwrap()
-            .satisfied_by_attempt
-            .as_deref(),
-        Some(context.acceptance().attempt_id.as_str())
-    );
-    assert!(partial
-        .requesters
-        .iter()
-        .find(|c| c.rationale == "not covered c")
-        .unwrap()
-        .satisfied_by_attempt
-        .is_none());
-
-    let next = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("md"), "cover remaining"),
-    )
-    .await
-    .unwrap()
-    .request;
-    let accepted = accept_card(&orch, &next).await.unwrap();
-    dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
-        .await
-        .unwrap();
-    let context = bump.context();
-    let mut verified = report(RequestAttemptOutcome::Done, true, true);
-    verified.built_commit = Some(commit('c'));
-    context
-        .report(&orch, "bump-built-c", verified)
-        .await
-        .unwrap();
-    let fulfilled = get(&orch, &r.id).await.unwrap().unwrap();
-    assert_eq!(fulfilled.state, RequestState::Done);
-    assert_gate(&orch, &fulfilled, "done", true).await;
-    assert_gate(&orch, &fulfilled, "accepted", false).await;
-    assert!(fulfilled.attempts.is_empty());
-    assert!(fulfilled.current_attempt.is_none());
-    assert_eq!(
-        fulfilled.fulfilled_by_attempt.as_deref(),
-        Some(context.acceptance().attempt_id.as_str())
-    );
-}
-
-#[tokio::test]
 async fn settled_failure_preserves_attempt_and_joins_late_successor_before_fresh_acceptance() {
     let orch = fixture().await;
     let consumer = register(&orch, RequestKind::Rebuild);
@@ -1052,17 +839,6 @@ async fn assert_gate(
     );
 }
 
-#[test]
-fn release_tier_overflow_is_refused_instead_of_wrapping() {
-    for (running, tier) in [
-        (ReleaseVersion(1, 2, u64::MAX), "sm"),
-        (ReleaseVersion(1, u64::MAX, 2), "md"),
-        (ReleaseVersion(u64::MAX, 1, 2), "lg"),
-    ] {
-        assert!(running.resolve(tier).unwrap_err().contains("overflow"));
-    }
-}
-
 #[tokio::test]
 async fn registered_consumer_cannot_be_replaced_by_another_adapter() {
     let orch = fixture().await;
@@ -1127,75 +903,21 @@ async fn agent_appearance_and_mismatched_operator_cannot_accept_or_decline() {
 }
 
 #[tokio::test]
-async fn failed_bump_leaves_linked_rebuild_open_and_successful_rebuild_does_not_fulfill_bump() {
-    let orch = fixture().await;
-    let rebuild = register(&orch, RequestKind::Rebuild);
-    let bump = register(&orch, RequestKind::BumpVersion);
-    let r = file_rebuild(&orch, "run", "open rebuild").await;
-    let b = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("sm"), "bump"),
-    )
-    .await
-    .unwrap()
-    .request;
-    let accepted = accept_card(&orch, &b).await.unwrap();
-    dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
-        .await
-        .unwrap();
-    bump.context()
-        .report(
-            &orch,
-            "bump-failed",
-            report(RequestAttemptOutcome::Failed, true, true),
-        )
-        .await
-        .unwrap();
-    let open = get(&orch, &r.id).await.unwrap().unwrap();
-    assert_eq!(open.state, RequestState::Open);
-    assert!(open.fulfilled_by_attempt.is_none());
-    assert!(open
-        .requesters
-        .iter()
-        .all(|c| c.satisfied_by_attempt.is_none()));
-    assert!(open.report.is_some());
-    let accepted = accept_card(&orch, &open).await.unwrap();
-    dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
-        .await
-        .unwrap();
-    rebuild
-        .context()
-        .report(
-            &orch,
-            "rebuild-done",
-            report(RequestAttemptOutcome::Done, true, true),
-        )
-        .await
-        .unwrap();
-    let still_bump = get(&orch, &b.id).await.unwrap().unwrap();
-    assert_eq!(still_bump.state, RequestState::Open);
-    assert!(still_bump.fulfilled_by_attempt.is_none());
-    assert_eq!(
-        still_bump.attempts[0].outcome,
-        Some(RequestAttemptOutcome::Failed)
-    );
-}
-
-#[tokio::test]
 async fn malformed_requests_refuse_before_persisting_intent() {
     let orch = fixture().await;
     register(&orch, RequestKind::Rebuild);
-    register(&orch, RequestKind::BumpVersion);
+    register(&orch, RequestKind::LiftDrain);
     for ask in [
         input(RequestKind::Rebuild, None, " "),
         input(RequestKind::Rebuild, Some("sm"), "invalid rebuild target"),
-        input(RequestKind::BumpVersion, Some("1.2.3"), "not newer"),
-        input(RequestKind::BumpVersion, Some("1.2.4-alpha"), "prerelease"),
     ] {
         assert!(file(&orch, &callback("run"), ask).await.is_err());
     }
-    let mut wrong_requirements = input(RequestKind::BumpVersion, Some("sm"), "wrong requirements");
+    let mut wrong_requirements = input(
+        RequestKind::LiftDrain,
+        Some("cairn://executors/machine"),
+        "wrong requirements",
+    );
     wrong_requirements.requirements.commits.push(commit('a'));
     assert!(file(&orch, &callback("run"), wrong_requirements)
         .await
@@ -1312,97 +1034,6 @@ async fn identical_bare_rebuild_refiling_preserves_original_commit_after_main_ad
 }
 
 #[tokio::test]
-async fn identical_tier_refiling_preserves_original_minimum_after_running_version_advances() {
-    let orch = fixture().await;
-    let consumer = register(&orch, RequestKind::BumpVersion);
-    let first = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("sm"), "same tier"),
-    )
-    .await
-    .unwrap()
-    .request;
-    consumer.facts.lock().unwrap().running_version = Some("1.2.9".into());
-    let duplicate = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("sm"), "same tier"),
-    )
-    .await
-    .unwrap()
-    .request;
-    assert_eq!(first.id, duplicate.id);
-    assert_eq!(duplicate.requesters.len(), 1);
-    assert_eq!(
-        duplicate.requesters[0].minimum_target.as_deref(),
-        Some("1.2.4")
-    );
-    assert_eq!(duplicate.target.as_deref(), Some("1.2.4"));
-    let distinct = file(
-        &orch,
-        &callback("run"),
-        input(
-            RequestKind::BumpVersion,
-            Some("sm"),
-            "new tier contribution",
-        ),
-    )
-    .await
-    .unwrap()
-    .request;
-    assert_eq!(distinct.requesters.len(), 2);
-    assert_eq!(distinct.target.as_deref(), Some("1.2.10"));
-    assert_eq!(
-        distinct
-            .requesters
-            .iter()
-            .find(|r| r.rationale == "same tier")
-            .unwrap()
-            .minimum_target
-            .as_deref(),
-        Some("1.2.4")
-    );
-}
-
-#[tokio::test]
-async fn identical_explicit_refiling_returns_original_request_but_never_authorizes_stale_target() {
-    let orch = fixture().await;
-    let consumer = register(&orch, RequestKind::BumpVersion);
-    let first = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("1.2.4"), "same explicit ask"),
-    )
-    .await
-    .unwrap()
-    .request;
-    consumer.facts.lock().unwrap().running_version = Some("1.2.9".into());
-    let repeated = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("1.2.4"), "same explicit ask"),
-    )
-    .await
-    .unwrap();
-    assert!(!repeated.created);
-    assert_eq!(repeated.request.id, first.id);
-    assert_eq!(repeated.request.revision, first.revision);
-    assert_eq!(repeated.request.requesters, first.requesters);
-    assert_eq!(repeated.request.target.as_deref(), Some("1.2.4"));
-    assert!(accept_card(&orch, &repeated.request)
-        .await
-        .unwrap_err()
-        .contains("stale"));
-    assert!(get(&orch, &first.id)
-        .await
-        .unwrap()
-        .unwrap()
-        .attempts
-        .is_empty());
-}
-
-#[tokio::test]
 async fn consumer_failure_secrets_are_scrubbed_before_outbox_and_request_report_persistence() {
     use crate::security::{
         registry as secrets, SecretCategory, SecretId, SecretMaterial, REDACTED,
@@ -1504,7 +1135,7 @@ async fn durable_context_recovery_requires_exact_registered_consumer_and_unresol
         &orch,
         &event,
         &intended,
-        TestConsumer::new(RequestKind::BumpVersion)
+        TestConsumer::new(RequestKind::LiftDrain)
     )
     .await
     .is_err());
@@ -1525,7 +1156,7 @@ async fn durable_context_recovery_requires_exact_registered_consumer_and_unresol
             "actor" => wrong.actor_id = "other.actor".into(),
             "install" => wrong.install_id = "other-install".into(),
             "target" => wrong.target = Some("2.0.0".into()),
-            "kind" => wrong.kind = RequestKind::BumpVersion,
+            "kind" => wrong.kind = RequestKind::LiftDrain,
             _ => unreachable!(),
         }
         assert!(
@@ -1585,17 +1216,10 @@ async fn durable_context_recovery_requires_exact_registered_consumer_and_unresol
 }
 
 #[tokio::test]
-async fn recovered_unsettled_failure_can_settle_but_cannot_restore_live_effects_or_bypass_policy() {
+async fn recovered_unsettled_failure_can_settle_but_cannot_restore_live_effects() {
     let orch = fixture().await;
-    let consumer = register(&orch, RequestKind::BumpVersion);
-    let card = file(
-        &orch,
-        &callback("run"),
-        input(RequestKind::BumpVersion, Some("sm"), "recover failed bump"),
-    )
-    .await
-    .unwrap()
-    .request;
+    let consumer = register(&orch, RequestKind::Rebuild);
+    let card = file_rebuild(&orch, "run", "recover failed rebuild").await;
     let accepted = accept_card(&orch, &card).await.unwrap();
     let event = accepted.attempts[0].authorization_event_id.clone();
     let intended = accepted.attempts[0].acceptance.clone();
@@ -1611,7 +1235,6 @@ async fn recovered_unsettled_failure_can_settle_but_cannot_restore_live_effects_
         .unwrap();
     drop(original);
     consumer.contexts.lock().unwrap().clear();
-    policy(&orch, true).await;
     let recovered = recover_claimed_request(&orch, &event, &intended, consumer.clone())
         .await
         .unwrap();
@@ -1636,10 +1259,6 @@ async fn recovered_unsettled_failure_can_settle_but_cannot_restore_live_effects_
     assert_eq!(reopened.state, RequestState::Open);
     assert_gate(&orch, &reopened, "accepted", true).await;
     assert_gate(&orch, &reopened, "done", false).await;
-    assert!(accept_card(&orch, &reopened)
-        .await
-        .unwrap_err()
-        .contains("human_base_merge_policy"));
     drop(recovered);
     let terminal = recover_claimed_request(&orch, &event, &intended, consumer.clone())
         .await
@@ -2778,7 +2397,7 @@ mod fenced_command_acceptance {
     use cairn_common::identity::DEVICE_OWNER_AUTHENTICATION_ISSUER;
     use cairn_common::requests::{ExecutorFloorWitness, FencedCommandAcceptance, FencedCommandAct};
 
-    fn act() -> FencedCommandAct {
+    pub(super) fn act() -> FencedCommandAct {
         FencedCommandAct {
             executor_id: "exec-1".into(),
             device_id: "device-1".into(),
@@ -2789,10 +2408,11 @@ mod fenced_command_acceptance {
             command: "touch ~/probe".into(),
             timeout_ms: 60_000,
             node: "cairn://p/project/1/1/builder".into(),
+            declaration: None,
         }
     }
 
-    fn device_owner(verified_at_ms: i64) -> (PrincipalRef, AppearanceSnapshot) {
+    pub(super) fn device_owner(verified_at_ms: i64) -> (PrincipalRef, AppearanceSnapshot) {
         let principal = PrincipalRef::Machine {
             device_id: "test-device".into(),
         };
@@ -2825,6 +2445,13 @@ mod fenced_command_acceptance {
     /// Filed through the store the service files through, so no live executor
     /// is needed to freeze the act; the facts come from the test consumer.
     async fn filed(orch: &Orchestrator) -> OperatorRequest {
+        filed_with(orch, act()).await.0
+    }
+
+    pub(super) async fn filed_with(
+        orch: &Orchestrator,
+        act: FencedCommandAct,
+    ) -> (OperatorRequest, Arc<TestConsumer>) {
         let consumer = register(orch, RequestKind::FencedCommand);
         // Exactly the shape `fenced_command::facts` produces: no commit, drain
         // or policy fields, which storage refuses on this kind's acceptance.
@@ -2839,7 +2466,7 @@ mod fenced_command_acceptance {
             fenced_command: None,
         };
         consumer.facts.lock().unwrap().fenced_command = Some(FencedCommandAcceptance {
-            act: act(),
+            act: act.clone(),
             witness: ExecutorFloorWitness {
                 connection_generation: 4,
                 executor_build_id: "build-9".into(),
@@ -2849,7 +2476,7 @@ mod fenced_command_acceptance {
             },
             scratch_head: None,
         });
-        let encoded = fenced_command::encode_act(&act()).unwrap();
+        let encoded = fenced_command::encode_act(&act).unwrap();
         let (origin_uri, wake_destination, run_id, principal) =
             origin(orch, &callback("run")).await.unwrap();
         let filed = store::file_request(
@@ -2858,7 +2485,7 @@ mod fenced_command_acceptance {
                 workspace_id: crate::authorization::WORKSPACE_ID.into(),
                 kind: RequestKind::FencedCommand,
                 target: Some(encoded.clone()),
-                target_identity: act().executor_id,
+                target_identity: act.executor_id.clone(),
                 coalescing_key: Some(fenced_command::coalescing_key(&encoded)),
                 contribution: RequestContribution {
                     id: String::new(),
@@ -2871,7 +2498,7 @@ mod fenced_command_acceptance {
                     waiting: vec!["cairn://p/project/1".into()],
                     requirements: Default::default(),
                     minimum_target: None,
-                    normalized_target: json!({"act": act()}),
+                    normalized_target: json!({"act": act}),
                     active: true,
                     satisfied_by_attempt: None,
                     created_at: 0,
@@ -2882,7 +2509,10 @@ mod fenced_command_acceptance {
         .await
         .unwrap();
         refresh_facts(orch, &filed.request.id).await.unwrap();
-        get(orch, &filed.request.id).await.unwrap().unwrap()
+        (
+            get(orch, &filed.request.id).await.unwrap().unwrap(),
+            consumer,
+        )
     }
 
     async fn authorization_events(orch: &Orchestrator) -> i64 {
@@ -2896,7 +2526,7 @@ mod fenced_command_acceptance {
             .unwrap()
     }
 
-    async fn accept_as(
+    pub(super) async fn accept_as(
         orch: &Orchestrator,
         card: &OperatorRequest,
         (principal, appearance): (PrincipalRef, AppearanceSnapshot),
@@ -2943,5 +2573,236 @@ mod fenced_command_acceptance {
         let frozen = &accepted.attempts[0].acceptance;
         assert!(meets_policy(RequestKind::FencedCommand, &frozen.appearance, None).is_ok());
         assert!(meets_policy(RequestKind::FencedCommand, &operator().1, None).is_err());
+    }
+}
+
+/// The chain processor over the registered test consumers: a declared bump
+/// that names `then: rebuild`, accepted with a device-owner check and
+/// reported `Done` on commit `b`, the landed commit.
+mod chain_processor {
+    use super::fenced_command_acceptance::{accept_as, act, device_owner, filed_with};
+    use super::*;
+    use cairn_common::requests::{DeclaredAct, DeclaredLands, FencedCommandAct};
+
+    fn bump() -> FencedCommandAct {
+        FencedCommandAct {
+            declaration: Some(DeclaredAct {
+                name: "bump".into(),
+                label: "Bump the version".into(),
+                consequence: "lands 1.2.4".into(),
+                params: vec![],
+                defined_by_commit: commit('a'),
+                declaration_digest: "e".repeat(64),
+                lands: Some(DeclaredLands {
+                    paths: vec!["package.json".into()],
+                    message: "bump 1.2.4".into(),
+                }),
+                then: Some(RequestKind::Rebuild),
+            }),
+            ..act()
+        }
+    }
+
+    /// Returns the parent attempt id.
+    async fn landed(orch: &Orchestrator) -> String {
+        let (card, fenced) = filed_with(orch, bump()).await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let accepted = accept_as(orch, &card, device_owner(now_ms)).await.unwrap();
+        let attempt = accepted.attempts[0].clone();
+        dispatch_accepted(orch, &attempt.authorization_event_id)
+            .await
+            .unwrap();
+        fenced
+            .context()
+            .report(
+                orch,
+                "landed",
+                report(RequestAttemptOutcome::Done, true, true),
+            )
+            .await
+            .unwrap();
+        attempt.id
+    }
+
+    async fn chain_of(orch: &Orchestrator, parent: &str) -> store::RequestChain {
+        store::get_chain(&orch.db.local, parent)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_landed_bump_accepts_its_rebuild_once_and_the_child_dispatches_through_recheck() {
+        let orch = fixture().await;
+        let rebuild = register(&orch, RequestKind::Rebuild);
+        let parent = landed(&orch).await;
+        // The outbox routes the chain's wake to the processor.
+        delivery::drain_once(&orch).await.unwrap();
+        let chain = chain_of(&orch, &parent).await;
+        assert_eq!(chain.state, store::ChainState::Accepted);
+        let child = get(&orch, chain.child_request_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.state, RequestState::Accepted);
+        assert_eq!(child.attempts.len(), 1);
+        let attempt = &child.attempts[0];
+        assert_eq!(Some(&attempt.id), chain.child_attempt_id.as_ref());
+        assert_eq!(attempt.acceptance.candidate_commit, Some(commit('b')));
+        assert_eq!(
+            attempt
+                .acceptance
+                .chained_from
+                .as_ref()
+                .unwrap()
+                .parent_attempt_id,
+            parent
+        );
+        // A replayed wake writes nothing more.
+        chain::process(&orch, &parent).await.unwrap();
+        let again = get(&orch, &child.id).await.unwrap().unwrap();
+        assert_eq!(again.attempts.len(), 1);
+        // The child takes the ordinary path: claim, then recheck_for in the
+        // consumer's dispatch, both through the chained provenance check.
+        dispatch_accepted(&orch, &attempt.authorization_event_id)
+            .await
+            .unwrap();
+        assert_eq!(rebuild.contexts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chain_waits_on_an_acting_rebuild_and_is_satisfied_by_its_build() {
+        let orch = fixture().await;
+        let rebuild = register(&orch, RequestKind::Rebuild);
+        let acting = file_rebuild(&orch, "thread-run", "ship the fix").await;
+        let acting = accept_card(&orch, &acting).await.unwrap();
+        dispatch_accepted(&orch, &acting.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        let parent = landed(&orch).await;
+        chain::process(&orch, &parent).await.unwrap();
+        let chain = chain_of(&orch, &parent).await;
+        assert_eq!(chain.state, store::ChainState::Pending);
+        let child = chain.child_request_id.clone().unwrap();
+
+        let wakes = |orch: Orchestrator| async move {
+            store::pending_outbox(&orch.db.local, 200)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|o| o.kind == "chain")
+                .count()
+        };
+        let before = wakes(orch.clone()).await;
+        // The acting rebuild finishes on `b`, which contains the landed commit.
+        rebuild
+            .context()
+            .report(
+                &orch,
+                "built",
+                report(RequestAttemptOutcome::Done, true, true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wakes(orch.clone()).await, before + 1, "settling wakes it");
+        chain::process(&orch, &parent).await.unwrap();
+        assert_eq!(
+            chain_of(&orch, &parent).await.state,
+            store::ChainState::Satisfied
+        );
+        let card = get(&orch, &child).await.unwrap().unwrap();
+        assert_eq!(card.state, RequestState::Done);
+        assert!(card.attempts.is_empty(), "no chained attempt was created");
+    }
+
+    #[tokio::test]
+    async fn a_chain_past_its_window_is_refused_and_its_card_stays_open() {
+        let orch = fixture().await;
+        register(&orch, RequestKind::Rebuild);
+        let parent = landed(&orch).await;
+        sql(&orch, "UPDATE request_chains SET deadline_unix_ms=1").await;
+        chain::process(&orch, &parent).await.unwrap();
+        let chain = chain_of(&orch, &parent).await;
+        assert_eq!(chain.state, store::ChainState::Refused);
+        assert_eq!(chain.refusal.as_deref(), Some(chain::WINDOW_CLOSED));
+        let card = get(&orch, chain.child_request_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(card.state, RequestState::Open);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_rebuild_consumer_refuses_the_chain_and_leaves_its_card() {
+        let orch = fixture().await;
+        let parent = landed(&orch).await;
+        chain::process(&orch, &parent).await.unwrap();
+        let chain = chain_of(&orch, &parent).await;
+        assert_eq!(chain.state, store::ChainState::Refused);
+        assert!(
+            chain.refusal.as_deref().unwrap().contains("UNAVAILABLE"),
+            "{:?}",
+            chain.refusal
+        );
+        // The card that is the operator's retry was filed before availability
+        // was read, and it still asks for exactly the landed commit.
+        let child = chain
+            .child_request_id
+            .as_deref()
+            .expect("the child is filed before the consumer is read");
+        let card = get(&orch, child).await.unwrap().unwrap();
+        assert_eq!(card.state, RequestState::Open);
+        assert!(
+            card.requesters
+                .iter()
+                .any(|c| c.active && c.requirements.commits == [chain.commit.clone()]),
+            "{:?}",
+            card.requesters
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_waiting_on_a_rebuild_that_never_settles_is_refused_at_its_deadline() {
+        let orch = fixture().await;
+        register(&orch, RequestKind::Rebuild);
+        let acting = file_rebuild(&orch, "thread-run", "ship the fix").await;
+        let acting = accept_card(&orch, &acting).await.unwrap();
+        dispatch_accepted(&orch, &acting.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        let parent = landed(&orch).await;
+        let chain_wakes = |orch: Orchestrator| async move {
+            store::pending_outbox(&orch.db.local, 200)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|o| o.kind == "chain")
+                .count()
+        };
+        // The chain's own wake finds the rebuild acting and is acknowledged.
+        delivery::drain_once(&orch).await.unwrap();
+        assert_eq!(
+            chain_of(&orch, &parent).await.state,
+            store::ChainState::Pending
+        );
+        assert_eq!(chain_wakes(orch.clone()).await, 0);
+        // Before the window closes, a sweep wakes nothing.
+        delivery::drain_once(&orch).await.unwrap();
+        assert_eq!(
+            chain_of(&orch, &parent).await.state,
+            store::ChainState::Pending
+        );
+        // The rebuild never settles; only the window closes.
+        sql(&orch, "UPDATE request_chains SET deadline_unix_ms=1").await;
+        delivery::drain_once(&orch).await.unwrap();
+        let chain = chain_of(&orch, &parent).await;
+        assert_eq!(chain.state, store::ChainState::Refused);
+        assert_eq!(chain.refusal.as_deref(), Some(chain::WINDOW_CLOSED));
+        assert_eq!(chain_wakes(orch.clone()).await, 0);
+        let card = get(&orch, chain.child_request_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(card.state, RequestState::Open);
     }
 }

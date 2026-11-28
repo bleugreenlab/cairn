@@ -23,7 +23,7 @@ use crate::config::project_settings::{
     UnsupportedCheck,
 };
 
-use super::context::MergeMrContext;
+use super::context::LandingSubject;
 
 const CONFIG_PATH: &str = ".cairn/config.yaml";
 
@@ -41,11 +41,11 @@ const CONFIG_PATH: &str = ".cairn/config.yaml";
 /// target: nothing is resolved through jj (whose loader may settle
 /// operations), and only the two exact commits are read, through Git.
 pub(super) async fn preflight_landing_config(
-    merge_context: &MergeMrContext,
+    merge_context: &LandingSubject,
     target_tip: &str,
     landing: &str,
 ) -> Result<Option<String>, String> {
-    let repository = PathBuf::from(&merge_context.mr.repo_path);
+    let repository = PathBuf::from(&merge_context.repo_path);
     let (source, target) = (
         merge_context.source_branch.clone(),
         merge_context.target_branch.clone(),
