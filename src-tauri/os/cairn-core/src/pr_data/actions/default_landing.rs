@@ -1133,17 +1133,10 @@ pub(crate) async fn land_request_commit(
         true,
     );
     let (state, detail) = gate.journal();
-    let merge_attempt = journal_policy_gate_event(
-        &db,
-        &subject,
-        attempt_id,
-        state,
-        &stored_policy,
-        None,
-        detail,
-    )
-    .await
-    .map_err(failed)?;
+    let merge_attempt =
+        journal_policy_gate_event(&db, &subject, state, &stored_policy, None, detail)
+            .await
+            .map_err(failed)?;
     let journal = MergeAttemptJournal {
         attempt_id: &merge_attempt,
         project_id,

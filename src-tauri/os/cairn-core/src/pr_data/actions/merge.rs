@@ -74,7 +74,6 @@ pub(super) fn enforce_human_base_merge_policy(
 pub(super) async fn journal_policy_gate_event(
     db: &LocalDb,
     subject: &super::context::LandingSubject,
-    owner_id: &str,
     state: &str,
     stored_policy: &str,
     attribution: Option<&super::PrResolutionAttribution>,
@@ -88,6 +87,7 @@ pub(super) async fn journal_policy_gate_event(
         })
         .to_string()
     });
+    let owner_id = subject.owner_id();
     let event_id = Uuid::new_v4().to_string();
     let detail = journal_detail(
         &MergeAttemptJournal {
@@ -927,7 +927,6 @@ async fn merge_pr_for_job_past_barrier(
     let attempt_id = journal_policy_gate_event(
         &db,
         &super::context::LandingSubject::from(&merge_context),
-        job_id,
         journal_state,
         &stored_policy,
         attribution.as_ref(),
@@ -1481,7 +1480,6 @@ mod tests {
             let attempt_id = journal_policy_gate_event(
                 &db,
                 &super::super::context::LandingSubject::from(&context),
-                "job",
                 "policy_disabled",
                 policy,
                 None,
@@ -1558,7 +1556,6 @@ mod tests {
         let attempt_id = journal_policy_gate_event(
             db,
             &super::super::context::LandingSubject::from(&merge_context(false, false)),
-            "job",
             "policy_disabled",
             DISABLED,
             None,
@@ -1763,7 +1760,6 @@ mod tests {
         let attempt_id = journal_policy_gate_event(
             &db,
             &super::super::context::LandingSubject::from(&context),
-            "job",
             "policy_unavailable",
             policy,
             None,

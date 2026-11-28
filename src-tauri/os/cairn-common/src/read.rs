@@ -826,7 +826,7 @@ pub fn failed_run_items(text: &str) -> Option<Vec<usize>> {
         return None;
     }
     let mut indices = Vec::new();
-    let mut tokens = rest.split(|c: char| c == ' ' || c == ',' || c == ';' || c == ':');
+    let mut tokens = rest.split([' ', ',', ';', ':']);
     while let Some(token) = tokens.next() {
         if token == "item" {
             if let Some(position) = tokens.next().and_then(|n| n.parse::<usize>().ok()) {
