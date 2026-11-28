@@ -38,6 +38,19 @@ macro_rules! live_execution_sql {
     };
 }
 
+/// True when execution `e` is in a status an execution runs in: `running` or
+/// `paused`. Only such an execution can join the run queue's list, so the
+/// queue's facts read is bounded by it beside the list's own rows. It is
+/// spelled exactly as the partial `idx_executions_live`'s predicate, which is
+/// what lets Turso substitute that index. Expects an `executions` row aliased
+/// `e`.
+#[macro_export]
+macro_rules! runnable_execution_status_sql {
+    () => {
+        "e.status IN ('running','paused')"
+    };
+}
+
 /// True when execution `e` was filed with `after:` gates and has not been
 /// released. On its own this does NOT mean the execution will start: see
 /// [`awaiting_release_sql!`]. Expects an `executions` row aliased `e`.

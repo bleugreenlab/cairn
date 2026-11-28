@@ -308,8 +308,7 @@ async fn the_eleven_two_statements_are_flagged_and_their_fixes_are_not() {
     assert_cases(&db, WIDE_ROW_TABLES, FIXTURES).await;
 
     // The held predicate as it planned before #4689 gave it a covering index.
-    // The run queue's covering index would serve it as well, so it goes too.
-    db.execute_batch("DROP INDEX idx_executions_hold_facts; DROP INDEX idx_executions_run_queue")
+    db.execute_batch("DROP INDEX idx_executions_hold_facts")
         .await
         .unwrap();
     assert_cases(

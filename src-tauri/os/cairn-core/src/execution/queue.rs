@@ -341,21 +341,67 @@ pub fn caps(orch: &Orchestrator) -> QueueCaps {
 const STORED_ROWS_SQL: &str =
     "SELECT execution_id, issue_id, rank, parked_at IS NOT NULL FROM run_queue ORDER BY rank, execution_id";
 
-/// Every live execution on this runner (`?1`) in one database: its issue, its
-/// thread, and whether it is runnable now. `held` is an execution waiting on
-/// an authored `after:` gate; it is not in the list until released. What each
-/// is doing is read beside it from its jobs' stored activity.
-const LIVE_EXECUTIONS_SQL: &str = concat!(
-    "SELECT e.id, e.issue_id, i.parent_thread_id,
-            CASE WHEN e.status IN ('running', 'paused') AND NOT (",
-    cairn_db::gated_unreleased_sql!(),
-    ") THEN 1 ELSE 0 END,
-            COALESCE(e.released_at, e.started_at), e.queue_state
-       FROM executions e INDEXED BY idx_executions_run_queue JOIN issues i ON i.id = e.issue_id
-      WHERE e.lifecycle IN ('canonical', 'pending')
-        AND COALESCE(e.runner_device_id, ?1) = ?1 AND ",
-    cairn_db::live_execution_sql!()
+/// The live executions on this runner (`?1`) in one database that `$source`
+/// names: each one's issue, its thread, and whether it is runnable now. `held`
+/// is an execution waiting on an authored `after:` gate; it is not in the list
+/// until released. What each is doing is read beside it from its jobs' stored
+/// activity. `$source` is the last conjunct, so a bound list can follow it.
+/// `CROSS JOIN` keeps the executions driving the issue lookup.
+macro_rules! live_executions_sql {
+    ($index:literal, $source:expr) => {
+        concat!(
+            "SELECT e.id, e.issue_id, i.parent_thread_id,
+                    CASE WHEN ",
+            cairn_db::runnable_execution_status_sql!(),
+            " AND NOT (",
+            cairn_db::gated_unreleased_sql!(),
+            ") THEN 1 ELSE 0 END,
+                    COALESCE(e.released_at, e.started_at), e.queue_state
+               FROM executions e ",
+            $index,
+            " CROSS JOIN issues i ON i.id = e.issue_id
+              WHERE e.lifecycle IN ('canonical', 'pending')
+                AND COALESCE(e.runner_device_id, ?1) = ?1 AND ",
+            cairn_db::live_execution_sql!(),
+            " AND ",
+            $source
+        )
+    };
+}
+
+/// The facts read touches only executions that can matter to the list. The
+/// facts are consulted for a row the list already holds (to keep or drop it,
+/// decide it, and record its state) and for a joiner, which must be runnable.
+/// Any other live execution (complete, failed, cancelled or held, and not
+/// listed) is never looked at, so reading it would only walk history. A
+/// complete or failed execution on an unresolved issue does stay listed, since
+/// its jobs can run again in place; it is read by its row's id.
+///
+/// The runnable half scans the partial `idx_executions_live`, whose predicate
+/// the bound spells, so it costs the executions running now.
+const RUNNABLE_EXECUTIONS_SQL: &str = live_executions_sql!(
+    "INDEXED BY idx_executions_live",
+    cairn_db::runnable_execution_status_sql!()
 );
+
+/// The listed half: the list's rows, by id, closed by [`listed_ids`]. No
+/// `INDEXED BY`: the pinned Turso serves a forced index only through an
+/// equality, and turns an `IN` list under the hint into a scan of the whole
+/// index (docs/database.md). Unhinted, each id seeks the covering
+/// `idx_executions_hold_facts`.
+const LISTED_EXECUTIONS_SQL: &str = live_executions_sql!("", "e.id IN ");
+
+/// Which of the listed ids this database knows at all, live or not, closed by
+/// [`listed_ids`]. Unhinted for the same reason as [`LISTED_EXECUTIONS_SQL`].
+const PRESENT_EXECUTIONS_SQL: &str = "SELECT e.id FROM executions e WHERE e.id IN ";
+
+/// The bound id list that closes [`LISTED_EXECUTIONS_SQL`] or
+/// [`PRESENT_EXECUTIONS_SQL`]: `count` values numbered from `?2`, after the
+/// runner's `?1`.
+fn listed_ids(count: usize) -> String {
+    let markers: Vec<String> = (2..count + 2).map(|n| format!("?{n}")).collect();
+    format!("({})", markers.join(", "))
+}
 
 async fn stored_rows_conn(conn: &TrackedConnection) -> DbResult<Vec<StoredRow>> {
     let mut rows = conn.query(STORED_ROWS_SQL, ()).await?;
@@ -419,12 +465,44 @@ async fn write_rows(
 /// recorded (`executions.queue_state`).
 type Located = HashMap<String, (Arc<LocalDb>, Option<String>)>;
 
-/// Every live execution on this runner, across every open database, and
-/// which executions those databases know of at all.
+/// One live execution's fact and the queue state its row last recorded.
+type LiveRow = (ExecutionFact, Option<String>);
+
+/// Read one statement's live executions into `live`. A runnable listed
+/// execution comes back from both halves; it is the same row both times.
+async fn read_live(
+    conn: &TrackedConnection,
+    sql: &str,
+    values: Vec<cairn_db::turso::Value>,
+    live: &mut HashMap<String, LiveRow>,
+) -> DbResult<()> {
+    let mut rows = conn.query(sql, values).await?;
+    while let Some(row) = rows.next().await? {
+        live.insert(
+            row.text(0)?,
+            (
+                ExecutionFact {
+                    issue_id: row.text(1)?,
+                    thread_id: row.opt_text(2)?,
+                    joinable: row.i64(3)? != 0,
+                    since: row.opt_i64(4)?.unwrap_or(0),
+                    activity: Activity::Dormant,
+                },
+                row.opt_text(5)?,
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// The live executions on this runner the list can need, across every open
+/// database (see [`RUNNABLE_EXECUTIONS_SQL`]), and which of the listed
+/// executions those databases know of at all.
 async fn execution_facts(
     orch: &Orchestrator,
     stored: &[StoredRow],
 ) -> Result<(HashMap<String, ExecutionFact>, HashSet<String>, Located), String> {
+    use cairn_db::turso::Value;
     let device = orch.anon_device_manager.device_id();
     let mut facts = HashMap::new();
     let mut known = HashSet::new();
@@ -436,44 +514,39 @@ async fn execution_facts(
             .read(move |conn| {
                 let (device, ids) = (device.clone(), ids.clone());
                 Box::pin(async move {
-                    let mut rows = conn
-                        .query(LIVE_EXECUTIONS_SQL, params![device.as_str()])
-                        .await?;
-                    let mut live = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        live.push((
-                            row.text(0)?,
-                            ExecutionFact {
-                                issue_id: row.text(1)?,
-                                thread_id: row.opt_text(2)?,
-                                joinable: row.i64(3)? != 0,
-                                since: row.opt_i64(4)?.unwrap_or(0),
-                                activity: Activity::Dormant,
-                            },
-                            row.opt_text(5)?,
-                        ));
-                    }
-                    drop(rows);
-                    let doing =
-                        cairn_db::stored_status::jobs::non_dormant_executions(conn).await?;
-                    for (id, fact, _) in &mut live {
-                        if let Some(activity) = doing.get(id.as_str()) {
-                            fact.activity = *activity;
-                        }
-                    }
+                    let mut live = HashMap::new();
+                    read_live(
+                        conn,
+                        RUNNABLE_EXECUTIONS_SQL,
+                        vec![Value::Text(device.clone())],
+                        &mut live,
+                    )
+                    .await?;
                     let mut present = Vec::new();
                     for chunk in ids.chunks(cairn_db::sql::IN_LIST_CHUNK) {
-                        let sql = format!(
-                            "SELECT id FROM executions INDEXED BY idx_executions_hold_facts WHERE id IN ({})",
-                            cairn_db::sql::placeholders(chunk.len())
-                        );
-                        let values: Vec<cairn_db::turso::Value> = chunk
-                            .iter()
-                            .map(|id| cairn_db::turso::Value::Text(id.clone()))
+                        let values: Vec<Value> = std::iter::once(&device)
+                            .chain(chunk)
+                            .map(|value| Value::Text(value.clone()))
                             .collect();
-                        let mut rows = conn.query(&sql, values).await?;
+                        let list = listed_ids(chunk.len());
+                        read_live(
+                            conn,
+                            &format!("{LISTED_EXECUTIONS_SQL}{list}"),
+                            values.clone(),
+                            &mut live,
+                        )
+                        .await?;
+                        let mut rows = conn
+                            .query(&format!("{PRESENT_EXECUTIONS_SQL}{list}"), values)
+                            .await?;
                         while let Some(row) = rows.next().await? {
                             present.push(row.text(0)?);
+                        }
+                    }
+                    let doing = cairn_db::stored_status::jobs::non_dormant_executions(conn).await?;
+                    for (id, (fact, _)) in &mut live {
+                        if let Some(activity) = doing.get(id.as_str()) {
+                            fact.activity = *activity;
                         }
                     }
                     Ok((live, present))
@@ -482,7 +555,7 @@ async fn execution_facts(
             .await
             .map_err(|error| format!("failed to read the run queue's executions: {error}"))?;
         known.extend(present);
-        for (id, fact, queue_state) in live {
+        for (id, (fact, queue_state)) in live {
             known.insert(id.clone());
             located.insert(id.clone(), (db.clone(), queue_state));
             facts.insert(id, fact);

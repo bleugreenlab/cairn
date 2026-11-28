@@ -1211,3 +1211,240 @@ async fn a_launch_with_no_seat_is_held_unless_it_carries_the_operators_message()
         "the operator's own message runs the addressed agent"
     );
 }
+
+/// The facts read as it stood before cairn/7718: every live execution on the
+/// runner, unbounded by the list or by status. The oracle for the bounded read.
+const UNBOUNDED_LIVE_EXECUTIONS_SQL: &str = concat!(
+    "SELECT e.id, e.issue_id, i.parent_thread_id,
+            CASE WHEN e.status IN ('running', 'paused') AND NOT (",
+    cairn_db::gated_unreleased_sql!(),
+    ") THEN 1 ELSE 0 END,
+            COALESCE(e.released_at, e.started_at), e.queue_state
+       FROM executions e JOIN issues i ON i.id = e.issue_id
+      WHERE e.lifecycle IN ('canonical', 'pending')
+        AND COALESCE(e.runner_device_id, ?1) = ?1 AND ",
+    cairn_db::live_execution_sql!()
+);
+
+/// What the unbounded read gave: facts, the known ids, and each live
+/// execution's recorded queue state.
+async fn unbounded_facts(
+    db: &LocalDb,
+    device: &str,
+    stored: &[StoredRow],
+) -> (
+    HashMap<String, ExecutionFact>,
+    HashSet<String>,
+    HashMap<String, Option<String>>,
+) {
+    let rows = db
+        .query_all(
+            UNBOUNDED_LIVE_EXECUTIONS_SQL,
+            (device.to_string(),),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    ExecutionFact {
+                        issue_id: row.text(1)?,
+                        thread_id: row.opt_text(2)?,
+                        joinable: row.i64(3)? != 0,
+                        since: row.opt_i64(4)?.unwrap_or(0),
+                        activity: Activity::Dormant,
+                    },
+                    row.opt_text(5)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    let doing = db
+        .read(|conn| {
+            Box::pin(
+                async move { cairn_db::stored_status::jobs::non_dormant_executions(conn).await },
+            )
+        })
+        .await
+        .unwrap();
+    let mut facts = HashMap::new();
+    let mut states = HashMap::new();
+    let mut known: HashSet<String> = HashSet::new();
+    for (id, mut fact, state) in rows {
+        if let Some(activity) = doing.get(&id) {
+            fact.activity = *activity;
+        }
+        known.insert(id.clone());
+        states.insert(id.clone(), state);
+        facts.insert(id, fact);
+    }
+    for row in stored {
+        let present = db
+            .query_opt_text(
+                "SELECT id FROM executions WHERE id = ?1",
+                (row.execution_id.clone(),),
+            )
+            .await
+            .unwrap();
+        known.extend(present);
+    }
+    (facts, known, states)
+}
+
+/// Execution `id` on its own issue number `n`, in `status` and `lifecycle`,
+/// started at `n`; its issue merged when `resolved`.
+async fn seed_shaped(
+    db: &LocalDb,
+    n: usize,
+    id: &str,
+    status: &str,
+    lifecycle: &str,
+    resolved: bool,
+) {
+    let merged = if resolved { "5" } else { "NULL" };
+    db.execute_script(format!(
+        "INSERT INTO issues(id,project_id,number,title,status,merged_at,created_at,updated_at)
+           VALUES('i-{id}','p',{n},'I','active',{merged},1,1);
+         INSERT INTO executions(id,recipe_id,issue_id,project_id,status,lifecycle,started_at,seq)
+           VALUES('{id}','recipe-default','i-{id}','p','{status}','{lifecycle}',{n},1);"
+    ))
+    .await
+    .unwrap();
+}
+
+/// cairn/7718: the facts read takes only the list's own rows and the
+/// executions that can join it, never history, and the queue it decides is the
+/// one the unbounded read decided. History here is every finished shape, on
+/// resolved and unresolved issues; beside it are runnable, held, listed and
+/// foreign executions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_facts_read_skips_history_and_decides_what_the_unbounded_read_did() {
+    use crate::execution::approvals::tests::{assert_index_only, query_plan, steps_reaching};
+    use cairn_db::turso::Value;
+
+    let orch = crate::resources::references::test_orchestrator(
+        crate::storage::migrated_test_db("run-queue-history.db").await,
+    );
+    let db = orch.db.local.clone();
+    let device = orch.anon_device_manager.device_id();
+    seed_project(&db).await;
+
+    let mut n = 100;
+    for status in ["complete", "failed", "cancelled"] {
+        for lifecycle in ["canonical", "superseded", "withdrawn"] {
+            for resolved in [true, false] {
+                for copy in 0..4 {
+                    n += 1;
+                    let id = format!("history-{status}-{lifecycle}-{resolved}-{copy}");
+                    seed_shaped(&db, n, &id, status, lifecycle, resolved).await;
+                }
+            }
+        }
+    }
+    for (n, id, status, lifecycle, resolved) in [
+        (3, "run-b", "paused", "canonical", false),
+        (5, "run-a", "running", "canonical", false),
+        (6, "run-pending", "running", "pending", false),
+        (1, "run-released", "running", "canonical", false),
+        (7, "run-merged", "running", "canonical", true),
+        (8, "run-superseded", "running", "superseded", false),
+        (9, "run-foreign", "running", "canonical", false),
+        (10, "held", "held", "canonical", false),
+        (11, "member-complete", "complete", "canonical", false),
+        (12, "member-failed", "failed", "canonical", false),
+        (13, "member-merged", "complete", "canonical", true),
+        (14, "member-cancelled", "cancelled", "canonical", false),
+    ] {
+        seed_shaped(&db, n, id, status, lifecycle, resolved).await;
+    }
+    db.execute_script(
+        "UPDATE issues SET parent_thread_id = NULL WHERE id = 'i-run-a';
+         UPDATE executions SET released_at = 7, queue_state = 'queued' WHERE id = 'run-released';
+         INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+           VALUES('g-released', 'run-released', 0, '{\"fact\":\"clock\"}', 1),
+                 ('g-held', 'held', 0, '{\"fact\":\"clock\"}', 1);
+         UPDATE executions SET runner_device_id = 'elsewhere' WHERE id = 'run-foreign';
+         UPDATE executions SET queue_state = 'parked' WHERE id = 'member-failed';
+         INSERT INTO run_queue(execution_id, issue_id, rank, parked_at, added_at)
+           VALUES('member-complete', 'i-member-complete', 1, NULL, 1),
+                 ('ghost', 'i-ghost', 2, NULL, 1),
+                 ('member-merged', 'i-member-merged', 3, NULL, 1),
+                 ('member-cancelled', 'i-member-cancelled', 4, NULL, 1),
+                 ('member-failed', 'i-member-failed', 5, 1, 1);",
+    )
+    .await
+    .unwrap();
+    seed_job(&db, "run-a", "j-run-a", "running").await;
+    seed_job(&db, "member-complete", "j-member-complete", "complete").await;
+    seed_stored_status(&db).await;
+
+    let stored = stored_rows(&db).await.unwrap();
+    let (facts, known, located) = execution_facts(&orch, &stored).await.unwrap();
+    let (old_facts, old_known, old_states) = unbounded_facts(&db, &device, &stored).await;
+
+    // Not one history row is read, live or not.
+    assert!(
+        facts.keys().all(|id| !id.starts_with("history-")),
+        "{facts:?}"
+    );
+    let ours = plan_membership(stored.clone(), &facts, &known);
+    let theirs = plan_membership(stored.clone(), &old_facts, &old_known);
+    assert_eq!(ours, theirs);
+    assert_eq!(ours.dropped, ["member-merged"]);
+    assert_eq!(
+        order(&ours.rows),
+        [
+            "member-complete",
+            "ghost",
+            "member-cancelled",
+            "run-b",
+            "run-a",
+            "run-pending",
+            "run-released"
+        ]
+    );
+    let state = decide(&ours.rows, &facts, CAPS, None);
+    assert_eq!(state, decide(&theirs.rows, &old_facts, CAPS, None));
+    for item in &state.items {
+        assert_eq!(
+            located
+                .get(&item.execution_id)
+                .map(|(_, recorded)| recorded.clone()),
+            old_states.get(&item.execution_id).cloned(),
+            "{}",
+            item.execution_id
+        );
+    }
+
+    // The plans: the runnable half scans only the partial live index, and the
+    // listed half and the presence probe seek each listed id, so both cost the
+    // list's length. Turso takes the primary key for that seek.
+    let runnable = query_plan(
+        &db,
+        RUNNABLE_EXECUTIONS_SQL.to_string(),
+        vec![Value::Text(device.clone())],
+    )
+    .await;
+    assert_index_only(&runnable, &["e"]);
+    assert!(
+        steps_reaching(&runnable, "e")
+            .iter()
+            .all(|step| step.contains("USING COVERING INDEX idx_executions_live")),
+        "{runnable}"
+    );
+    let values = vec![
+        Value::Text(device.clone()),
+        Value::Text("member-complete".into()),
+        Value::Text("ghost".into()),
+    ];
+    for sql in [LISTED_EXECUTIONS_SQL, PRESENT_EXECUTIONS_SQL] {
+        let sql = format!("{sql}{}", listed_ids(2));
+        let plan = query_plan(&db, sql.clone(), values.clone()).await;
+        let steps = steps_reaching(&plan, "e");
+        assert!(!steps.is_empty(), "{sql}:\n{plan}");
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.starts_with("SEARCH ") && step.contains("(id=?)")),
+            "{sql}:\n{plan}"
+        );
+    }
+}
