@@ -250,6 +250,9 @@ async fn every_selection_and_delete_seeks() {
     for walk in [AD_HOC_RESOURCE_WALK, AD_HOC_DURATION_WALK] {
         assert_seeks(&db, walk, 5, "USING INDEX").await;
     }
+    for walk in [RUN_QUEUE_WALK, RESOLUTION_CLEANUP_WALK, PIN_MOVE_WALK] {
+        assert_seeks(&db, walk, 3, ROWID).await;
+    }
     for table in [
         "codex_watchdog_lifecycle",
         "effect_outbox",
@@ -264,6 +267,9 @@ async fn every_selection_and_delete_seeks() {
         "execution_queue_closed_incarnations",
         "command_resource_profiles",
         "command_duration_profiles",
+        "run_queue",
+        "resolution_cleanups",
+        "inference_pin_moves",
     ] {
         let delete = format!("DELETE FROM {table} WHERE rowid IN ({})", placeholders(3));
         assert_seeks(&db, &delete, 3, ROWID).await;
@@ -1515,6 +1521,131 @@ async fn only_aged_ad_hoc_command_profiles_are_evicted() {
             ["ad-hoc:fresh", "configured-check-key"]
         );
     }
+}
+
+#[tokio::test]
+async fn run_queue_rows_go_an_hour_after_their_execution_settles() {
+    let (_temp, db) = private_db().await;
+    seed_owners(&db).await;
+    let (old, recent) = (NOW - 2 * HOUR, NOW - HOUR / 6);
+    db.execute_script(format!(
+        "INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at,merged_at)
+             VALUES ('merged-old','p',2,'M','merged','none',1,1,{old}),
+                    ('merged-recent','p',3,'R','merged','none',1,1,{recent});
+         INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,lifecycle,completed_at)
+             VALUES ('live','r','i','p','running',1,'canonical',NULL),
+                    ('on-merged-old','r','merged-old','p','complete',1,'canonical',NULL),
+                    ('on-merged-recent','r','merged-recent','p','complete',1,'canonical',NULL),
+                    ('withdrawn-old','r','i','p','withdrawn',1,'withdrawn',{old}),
+                    ('withdrawn-recent','r','i','p','withdrawn',1,'withdrawn',{recent}),
+                    ('superseded-unstamped','r','i','p','superseded',1,'superseded',NULL);
+         INSERT INTO run_queue (execution_id,issue_id,rank,parked_at,added_at)
+             VALUES ('live','i',1,NULL,{old}),
+                    ('on-merged-old','merged-old',2,NULL,{old}),
+                    ('on-merged-recent','merged-recent',3,NULL,{old}),
+                    ('withdrawn-old','i',4,{old},{old}),
+                    ('withdrawn-recent','i',5,NULL,{old}),
+                    ('superseded-unstamped','i',6,NULL,{old}),
+                    ('in-another-database','elsewhere',7,NULL,{old});"
+    ))
+    .await
+    .unwrap();
+
+    let report = run(&db, UNBOUNDED, &[Eviction::FinishedRunQueueEntries]).await;
+
+    assert_eq!(report.rules[0].rows, 3, "{report}");
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT execution_id FROM run_queue ORDER BY execution_id"
+        )
+        .await,
+        [
+            "in-another-database",
+            "live",
+            "on-merged-recent",
+            "withdrawn-recent"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn resolution_cleanups_go_once_their_subject_is_gone() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let (old, recent) = (NOW - 2 * HOUR, NOW - HOUR / 6);
+    db.execute_script(format!(
+        "INSERT INTO resolution_cleanups (kind,subject_id,run_id,resolution,resolution_generation,token,recorded_at)
+             VALUES ('issue','i',NULL,'merged',1,'k1',{old}),
+                    ('issue','deleted-issue',NULL,'merged',1,'k2',{old}),
+                    ('issue','deleted-just-now',NULL,'closed',1,'k3',{recent}),
+                    ('calls','t','r','closed',NULL,NULL,{old}),
+                    ('calls','deleted-turn','r','closed',NULL,NULL,{old});"
+    ))
+    .await
+    .unwrap();
+
+    let report = run(&db, UNBOUNDED, &[Eviction::GoneResolutionCleanups]).await;
+
+    assert_eq!(report.rules[0].rows, 2, "{report}");
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT kind || ':' || subject_id FROM resolution_cleanups ORDER BY 1"
+        )
+        .await,
+        ["calls:t", "issue:deleted-just-now", "issue:i"]
+    );
+}
+
+#[tokio::test]
+async fn ended_pin_moves_go_after_a_week_once_their_candidate_is_gone() {
+    let (_temp, db) = private_db().await;
+    let (old, recent) = (NOW_MS - 8 * DAY_MS, NOW_MS - DAY_MS);
+    let moves = [
+        ("moved-old", "moved", Some(old), "removed-1"),
+        ("failed-old", "failed", Some(old), "removed-2"),
+        (
+            "failed-old-candidate-left",
+            "failed",
+            Some(old),
+            "left-behind",
+        ),
+        ("failed-recent", "failed", Some(recent), "removed-3"),
+        ("verifying", "verifying", None, "removed-4"),
+    ];
+    db.execute(
+        "INSERT INTO inference_profiles (id, source, body_json, created_at, updated_at)
+         VALUES ('left-behind', 'cairn', '{}', 0, 0)",
+        (),
+    )
+    .await
+    .unwrap();
+    for (id, state, finished_at, candidate) in moves {
+        db.execute(
+            "INSERT INTO inference_pin_moves (id, profile_id, candidate_id, pool_id, template_id,
+                 from_engine, to_engine, profile_digest, candidate_digest, surface_digest,
+                 governed, state, started_at, finished_at)
+             VALUES (?1, ?1, ?2, 'pool', 'template', 'a', 'b', 'd', 'd', 'd', 0, ?3, ?4, ?5)",
+            (
+                id.to_string(),
+                candidate.to_string(),
+                state.to_string(),
+                old - DAY_MS,
+                finished_at.map_or(Value::Null, Value::Integer),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let report = run(&db, UNBOUNDED, &[Eviction::EndedPinMoves]).await;
+
+    assert_eq!(report.rules[0].rows, 2, "{report}");
+    assert_eq!(
+        ids(&db, "SELECT id FROM inference_pin_moves ORDER BY id").await,
+        ["failed-old-candidate-left", "failed-recent", "verifying"]
+    );
 }
 
 fn watchdog_eviction() -> Eviction {

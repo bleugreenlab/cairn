@@ -454,6 +454,14 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "execution_queue_closed_incarnations",
         Eviction::SettledQueueEntries,
     ),
+    // One row of about 100 B per live issue execution on this runner, plus
+    // the finished ones a queue pass has not reached yet.
+    evict("run_queue", Eviction::FinishedRunQueueEntries).budget(16),
+    // One row per resolved issue or resolution-cancelled turn whose clean-up
+    // is still owed; the settlement retry deletes the ones it finishes.
+    evict("resolution_cleanups", Eviction::GoneResolutionCleanups).budget(16),
+    // A few rows of about 1 KB per re-verify the operator starts.
+    evict("inference_pin_moves", Eviction::EndedPinMoves).budget(4),
     undecided(
         "job_file_activity",
         "cairn://p/cairn/performance",
@@ -899,6 +907,15 @@ const QUEUE_PAGE_BYTES: i64 = 4 * 1024 * 1024;
 /// The states an entry ends in. An entry whose newest row is in one of them
 /// is settled; any other newest row (`queued`, `offered`, `claimed`) is live.
 const QUEUE_TERMINAL_STATES: [&str; 3] = ["completed", "cancelled", "expired"];
+/// A run-queue row whose execution stopped being live goes this long after it
+/// settled. The queue's own pass drops such a row as soon as it reads it; the
+/// window only keeps the evictor from racing that pass.
+const FINISHED_RUN_QUEUE_AGE_S: i64 = 60 * 60;
+/// A resolution clean-up whose subject is gone goes this long after it was
+/// recorded, giving the settlement retry the first claim on it.
+const GONE_RESOLUTION_CLEANUP_AGE_S: i64 = 60 * 60;
+/// An ended re-verify's row stays this long, for the Inference page's history.
+const ENDED_PIN_MOVE_AGE_S: i64 = 7 * DAY_S;
 /// The resolution `durable_suspend::relinquish_to_inner_wait` writes when a
 /// permission takes over a call's continuation. Withdrawing that permission
 /// moves the row back to `pending` (`reclaim_from_inner_wait`), so such a row is
@@ -958,6 +975,45 @@ pub(crate) const AD_HOC_RESOURCE_WALK: &str = "SELECT rowid FROM command_resourc
 pub(crate) const AD_HOC_DURATION_WALK: &str = "SELECT rowid FROM command_duration_profiles \
      WHERE identity_version = ?1 AND command_identity >= ?2 AND command_identity < ?3 \
      AND updated_at_unix_ms < ?4 LIMIT ?5";
+
+/// Run-queue rows in rowid order, each flagged when its execution, in this
+/// database, is no longer live and settled before `?2`: at its issue's
+/// resolution, else at its own completion, else (a supersession stamps
+/// neither) when it joined, which is earlier still. A row whose execution this
+/// database does not hold is never flagged: the execution may live in a team
+/// replica, and only the queue's own pass reads every open database.
+pub(crate) const RUN_QUEUE_WALK: &str = concat!(
+    "SELECT q.rowid, CASE WHEN EXISTS (SELECT 1 FROM executions e \
+     WHERE e.id = q.execution_id AND NOT (",
+    crate::live_execution_sql!(),
+    ") AND COALESCE((SELECT COALESCE(i.merged_at, i.closed_at) FROM issues i \
+     WHERE i.id = e.issue_id), e.completed_at, q.added_at) < ?2) THEN 1 ELSE 0 END \
+     FROM run_queue q WHERE q.rowid > ?1 ORDER BY q.rowid LIMIT ?3"
+);
+
+/// Resolution clean-ups in rowid order, each flagged when it was recorded
+/// before `?2` and its subject (the issue, or the turn) no longer exists: the
+/// clean-up it records is then done for good, and no later write can reuse the
+/// subject's id. One whose issue merely reads unresolved, or resolved at
+/// another generation, is the settlement retry's: it deletes that entry under
+/// the enrolment token, which a fresh enrolment of the same row replaces.
+pub(crate) const RESOLUTION_CLEANUP_WALK: &str = "SELECT c.rowid, CASE WHEN c.recorded_at < ?2 \
+     AND CASE c.kind \
+     WHEN 'issue' THEN NOT EXISTS (SELECT 1 FROM issues i WHERE i.id = c.subject_id) \
+     ELSE NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = c.subject_id) END \
+     THEN 1 ELSE 0 END \
+     FROM resolution_cleanups c WHERE c.rowid > ?1 ORDER BY c.rowid LIMIT ?3";
+
+/// Re-verifies in rowid order, each flagged when it ended before `?2`
+/// (milliseconds) and its candidate profile is gone. The promotion gate keeps a
+/// candidate out of placement only by its row here, and a failed re-verify can
+/// leave its candidate in the inventory until the next start removes it, so the
+/// row outlives the candidate.
+pub(crate) const PIN_MOVE_WALK: &str = "SELECT m.rowid, CASE WHEN m.state <> 'verifying' \
+     AND m.finished_at < ?2 \
+     AND NOT EXISTS (SELECT 1 FROM inference_profiles p WHERE p.id = m.candidate_id) \
+     THEN 1 ELSE 0 END \
+     FROM inference_pin_moves m WHERE m.rowid > ?1 ORDER BY m.rowid LIMIT ?3";
 
 /// Regenerations in rowid order. The table is small (this rule keeps it to
 /// about one row per rule per live branch), so a pass walks it whole.
@@ -1050,12 +1106,23 @@ pub enum Eviction {
     /// what the project configures; configured-check and submitter identities
     /// are never deleted.
     AdHocCommandProfiles,
+    /// `run_queue` rows whose execution, in this database, stopped being live
+    /// (superseded, withdrawn, or its issue merged or closed) more than an hour
+    /// ago. The queue drops these itself; this rule is the bound when no pass
+    /// reaches them.
+    FinishedRunQueueEntries,
+    /// `resolution_cleanups` entries recorded more than an hour ago whose issue
+    /// or turn no longer exists.
+    GoneResolutionCleanups,
+    /// `inference_pin_moves` re-verifies that ended more than a week ago and
+    /// whose candidate profile is gone. One still verifying is never deleted.
+    EndedPinMoves,
 }
 
 impl Eviction {
     /// The initial order before budget-driven rotation. Watchdog evidence gets
     /// the first runtime turn rather than waiting behind payload-heavy journals.
-    pub const ALL: [Eviction; 10] = [
+    pub const ALL: [Eviction; 13] = [
         Eviction::WatchdogLifecycle,
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
@@ -1066,6 +1133,9 @@ impl Eviction {
         Eviction::SettledRegenerations,
         Eviction::SettledQueueEntries,
         Eviction::AdHocCommandProfiles,
+        Eviction::FinishedRunQueueEntries,
+        Eviction::GoneResolutionCleanups,
+        Eviction::EndedPinMoves,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1080,6 +1150,9 @@ impl Eviction {
             Eviction::SettledRegenerations => "settled_regenerations",
             Eviction::SettledQueueEntries => "settled_queue_entries",
             Eviction::AdHocCommandProfiles => "ad_hoc_command_profiles",
+            Eviction::FinishedRunQueueEntries => "finished_run_queue_entries",
+            Eviction::GoneResolutionCleanups => "gone_resolution_cleanups",
+            Eviction::EndedPinMoves => "ended_pin_moves",
         }
     }
 
@@ -1100,6 +1173,9 @@ impl Eviction {
             Eviction::AdHocCommandProfiles => {
                 &["command_resource_profiles", "command_duration_profiles"]
             }
+            Eviction::FinishedRunQueueEntries => &["run_queue"],
+            Eviction::GoneResolutionCleanups => &["resolution_cleanups"],
+            Eviction::EndedPinMoves => &["inference_pin_moves"],
         }
     }
 
@@ -1121,6 +1197,25 @@ impl Eviction {
             Eviction::SettledRegenerations => select_settled_regenerations(db, now, cursor).await?,
             Eviction::SettledQueueEntries => select_settled_queue_entries(db, now, cursor).await?,
             Eviction::AdHocCommandProfiles => select_ad_hoc_profiles(db, now).await?,
+            Eviction::FinishedRunQueueEntries => {
+                let cutoff = now - FINISHED_RUN_QUEUE_AGE_S;
+                select_flagged(db, "run_queue", RUN_QUEUE_WALK, cutoff, cursor).await?
+            }
+            Eviction::GoneResolutionCleanups => {
+                let cutoff = now - GONE_RESOLUTION_CLEANUP_AGE_S;
+                select_flagged(
+                    db,
+                    "resolution_cleanups",
+                    RESOLUTION_CLEANUP_WALK,
+                    cutoff,
+                    cursor,
+                )
+                .await?
+            }
+            Eviction::EndedPinMoves => {
+                let cutoff = (now - ENDED_PIN_MOVE_AGE_S) * 1_000;
+                select_flagged(db, "inference_pin_moves", PIN_MOVE_WALK, cutoff, cursor).await?
+            }
         };
         let select = started.elapsed();
         let rows = selection.rows();
@@ -1367,6 +1462,38 @@ async fn select_applied_search_outbox(
         })
         .await?;
     Ok(journal_page("search_outbox", rows, cutoff, cursor))
+}
+
+/// One page of a small table's walk: `walk` reads up to [`PAGE_ROWS`] rows
+/// after the cursor's rowid as `(rowid, flagged)`, binding the cursor,
+/// `cutoff` and the page size, and the flagged rows are deleted. The page
+/// stops short only at the end of the table, so a pass walks it whole.
+async fn select_flagged(
+    db: &LocalDb,
+    table: &'static str,
+    walk: &'static str,
+    cutoff: i64,
+    cursor: &mut Cursor,
+) -> DbResult<Selection> {
+    let walked = db
+        .query_all(walk, (cursor.rowid, cutoff, PAGE_ROWS as i64), |row| {
+            Ok((row.i64(0)?, row.i64(1)? != 0))
+        })
+        .await?;
+    if let Some(&(last, _)) = walked.last() {
+        cursor.rowid = last;
+    }
+    Ok(Selection {
+        done: walked.len() < PAGE_ROWS,
+        deletes: vec![(
+            table,
+            walked
+                .into_iter()
+                .filter_map(|(rowid, flagged)| flagged.then_some(rowid))
+                .collect(),
+        )],
+        ..Selection::default()
+    })
 }
 
 async fn select_watchdog_lifecycle(db: &LocalDb, now: i64) -> DbResult<Selection> {

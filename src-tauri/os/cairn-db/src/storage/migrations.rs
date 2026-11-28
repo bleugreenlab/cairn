@@ -2267,6 +2267,18 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     // Which of this install's runner incarnations have had their queue entries
     // closed: an index over the runner-local journal above.
+    // The run queue: this runner's ordered list of the issue executions it
+    // wants to run, across every database it opens.
+    (
+        "run_queue",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // Re-verifies of this install's inference profiles onto their engine pins,
+    // beside the verifications they run.
+    (
+        "inference_pin_moves",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "execution_queue_closed_incarnations",
         TableScope::Private(PrivateReason::RunnerTransient),
