@@ -391,16 +391,17 @@ fn shell_action_result(
             over.ceiling_bytes, over.batch_ceiling_bytes
         ));
     }
-    let failure = envelope.text.lines().rev().find_map(|line| {
-        line.strip_prefix("Exit code: ")
-            .and_then(|code| code.trim().parse::<i32>().ok())
-            .filter(|code| *code != 0)
-    });
-    if let Some(exit_code) = failure {
-        return Err(format!(
-            "Action command failed with exit code {exit_code}: {}",
-            envelope.text
-        ));
+    if envelope.is_error() {
+        let exit_code = envelope.items.iter().find_map(|item| item.exit_code);
+        return Err(match exit_code {
+            Some(code) if code != 0 => {
+                format!(
+                    "Action command failed with exit code {code}: {}",
+                    envelope.text
+                )
+            }
+            _ => envelope.text,
+        });
     }
     if crate::mcp::handlers::run::envelope_reports_run_failure(&envelope.text) {
         return Err(envelope.text);
@@ -3586,7 +3587,32 @@ mod tests {
             invalid_input: false,
             data: None,
             over_ceiling,
+            items: Vec::new(),
+            batch: None,
         }
+    }
+
+    /// A shell action fails from its item's typed status: the text need not
+    /// say anything about an exit for the action to fail with its code.
+    #[test]
+    fn a_shell_action_fails_from_its_items_exit_status_not_its_text() {
+        use cairn_common::read::{RunItemEnd, RunItemStatus};
+        let envelope = cairn_common::read::RunBatchEnvelope {
+            items: vec![RunItemStatus {
+                exit_code: Some(3),
+                ended: RunItemEnd::Exited,
+                succeeded: false,
+            }],
+            ..run_envelope("partial output, no exit line", None)
+        };
+        let error = shell_action_result(envelope).unwrap_err();
+        assert!(error.contains("exit code 3"), "{error}");
+
+        let timed_out = cairn_common::read::RunBatchEnvelope {
+            items: vec![RunItemStatus::failed(RunItemEnd::TimedOut)],
+            ..run_envelope("Command timed out after 10ms", None)
+        };
+        assert!(shell_action_result(timed_out).is_err());
     }
 
     /// A shell action's run is composed for code, so an output past the 45k a

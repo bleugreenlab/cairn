@@ -53,6 +53,8 @@ fn collapse_envelope_text_extracts_run_text_and_drops_images() {
         invalid_input: false,
         data: None,
         over_ceiling: None,
+        items: Vec::new(),
+        batch: None,
     };
     let json = serde_json::to_string(&envelope).unwrap();
     assert_eq!(collapse_envelope_text(json), "=== look ===\nAX tree");

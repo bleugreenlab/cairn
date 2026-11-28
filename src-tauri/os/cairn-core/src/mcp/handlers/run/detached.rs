@@ -1211,6 +1211,11 @@ pub(crate) fn summary_line(batch: &DetachedBatch, home: &str, live: &LiveState) 
 
 /// The verdict a settled batch's composed text states, when no settlement
 /// recorded one: a failure of the run itself names itself by its opening.
+/// The verdict of a batch every item of which succeeded. Every other verdict
+/// names a failure, so a delivery that holds only a verdict (a result adopted
+/// after a restart) answers its call as a failed tool result unless it is this.
+pub(crate) const SUCCEEDED_VERDICT: &str = "succeeded";
+
 pub(crate) fn verdict_from_text(text: &str) -> String {
     use super::{RUN_CANCELLED, RUN_NOT_EXECUTED, RUN_NOT_PUBLISHED, RUN_OUTCOME_UNKNOWN};
     if text.starts_with(RUN_NOT_EXECUTED) {
@@ -1298,7 +1303,7 @@ pub(crate) fn completion_result(
 ) -> (String, String) {
     use cairn_common::executor_protocol::CellCompletionVerdict;
     let verdict = match completion.verdict {
-        CellCompletionVerdict::Succeeded => "succeeded",
+        CellCompletionVerdict::Succeeded => SUCCEEDED_VERDICT,
         CellCompletionVerdict::Failed => "failed",
         CellCompletionVerdict::TimedOut => "timed out",
         CellCompletionVerdict::Cancelled => "it was cancelled",

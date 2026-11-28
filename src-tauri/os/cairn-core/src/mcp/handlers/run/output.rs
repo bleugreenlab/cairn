@@ -6,7 +6,8 @@ use crate::mcp::handlers::read::view;
 use crate::mcp::types::McpCallbackRequest;
 use cairn_common::executor_protocol::{relay_wire_len, RELAY_RESPONSE_BYTE_BUDGET};
 use cairn_common::read::{
-    AnchoredText, ImageBlock, OverCeiling, OverCeilingItem, RunBatchEnvelope,
+    AnchoredText, ImageBlock, OverCeiling, OverCeilingItem, RunBatchEnvelope, RunItemEnd,
+    RunItemStatus,
 };
 
 /// What a batch composed for code may carry in total, measured as its item
@@ -176,16 +177,23 @@ fn water_fill_budgets(natural: &[usize], total: usize) -> Vec<usize> {
 /// Serializing a struct of string/array fields does not fail in practice; the
 /// fallback returns the bare text so a run never errors on rendering.
 pub(super) fn run_envelope(text: String, images: Vec<ImageBlock>) -> String {
-    run_envelope_with_data(text, images, None, None)
+    encode_envelope(RunBatchEnvelope {
+        images,
+        ..RunBatchEnvelope::text(text)
+    })
 }
 
-/// [`run_envelope`] carrying each item's typed result ([`collect_run_data`])
-/// and the items refused past the code-facing ceiling ([`ComposedRun`]).
+/// A batch's envelope: its text and images, each item's typed result
+/// ([`collect_run_data`]) and status, the items refused past the code-facing
+/// ceiling ([`ComposedRun`]), and the batch's own status when it ended
+/// without its items.
 pub(super) fn run_envelope_with_data(
     text: String,
     images: Vec<ImageBlock>,
     data: Option<Vec<serde_json::Value>>,
     over_ceiling: Option<OverCeiling>,
+    items: Vec<RunItemStatus>,
+    batch: Option<RunItemStatus>,
 ) -> String {
     encode_envelope(RunBatchEnvelope {
         text,
@@ -193,6 +201,8 @@ pub(super) fn run_envelope_with_data(
         data,
         invalid_input: false,
         over_ceiling,
+        items,
+        batch,
     })
 }
 
@@ -200,12 +210,29 @@ pub(super) fn run_envelope_with_data(
 /// the transport edges surface it as an input error rather than a batch result.
 pub(super) fn run_input_refusal(text: String) -> String {
     encode_envelope(RunBatchEnvelope {
-        text,
-        images: Vec::new(),
         invalid_input: true,
-        data: None,
-        over_ceiling: None,
+        ..RunBatchEnvelope::text(text)
     })
+}
+
+/// The envelope for a batch that ended as a whole without its items' results:
+/// `text` says how, and `batch` types it.
+pub(super) fn failure_envelope(text: String, batch: RunItemStatus) -> String {
+    encode_envelope(RunBatchEnvelope {
+        batch: Some(batch),
+        ..RunBatchEnvelope::text(text)
+    })
+}
+
+/// Each item's status in input order, an item that never started included:
+/// `outcomes` holds only the items that ran, and a sequential batch that
+/// stopped early leaves the rest of its `item_count` unreported.
+pub(super) fn item_statuses(outcomes: &[ItemOutcome], item_count: usize) -> Vec<RunItemStatus> {
+    let mut statuses: Vec<RunItemStatus> = outcomes.iter().map(ItemOutcome::status).collect();
+    while statuses.len() < item_count {
+        statuses.push(RunItemStatus::failed(RunItemEnd::NotRun));
+    }
+    statuses
 }
 
 fn encode_envelope(envelope: RunBatchEnvelope) -> String {
@@ -795,6 +822,8 @@ mod tests {
             header: header.to_string(),
             body: body.to_string(),
             succeeded,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
@@ -1341,8 +1370,14 @@ mod tests {
                 .collect::<Vec<_>>()),
             Some(vec![1])
         );
-        let envelope =
-            run_envelope_with_data(composed.text, Vec::new(), None, composed.over_ceiling);
+        let envelope = run_envelope_with_data(
+            composed.text,
+            Vec::new(),
+            None,
+            composed.over_ceiling,
+            Vec::new(),
+            None,
+        );
         let frame = serde_json::to_string(&envelope).unwrap();
         assert!(
             frame.len() < RELAY_RESPONSE_BYTE_BUDGET,

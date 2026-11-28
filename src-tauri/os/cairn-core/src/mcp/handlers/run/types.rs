@@ -279,6 +279,11 @@ pub(crate) struct ItemOutcome {
     pub(crate) header: String,
     pub(crate) body: String,
     pub(crate) succeeded: bool,
+    /// Its process's exit code; `None` for an item with no process.
+    pub(crate) exit_code: Option<i32>,
+    /// How it ended. Everything that is not a process ends `Exited`: it ran
+    /// to its own answer, and `succeeded` says whether that answer was good.
+    pub(crate) ended: cairn_common::read::RunItemEnd,
     /// The item durably suspended on a worktree-fence approval; the whole batch
     /// re-runs on resume. Carried so `handle_run` can surface the suspend marker.
     pub(crate) suspended: bool,
@@ -307,6 +312,8 @@ impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutc
             header: outcome.header,
             body: outcome.body,
             succeeded: outcome.succeeded,
+            exit_code: outcome.exit_code,
+            ended: process_ending(outcome.timed_out, outcome.stop.as_ref()),
             suspended: outcome.suspended,
             images: outcome
                 .images
@@ -317,6 +324,22 @@ impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutc
             data: None,
             whole: false,
         }
+    }
+}
+
+/// How a process item ended, from what its executor reported: a stop the
+/// executor made outranks the timeout, which outranks the exit.
+pub(crate) fn process_ending(
+    timed_out: bool,
+    stop: Option<&cairn_common::executor_protocol::CommandStop>,
+) -> cairn_common::read::RunItemEnd {
+    use cairn_common::executor_protocol::CommandStop;
+    use cairn_common::read::RunItemEnd;
+    match stop {
+        Some(CommandStop::Cancelled) => RunItemEnd::Cancelled,
+        Some(_) => RunItemEnd::Killed,
+        None if timed_out => RunItemEnd::TimedOut,
+        None => RunItemEnd::Exited,
     }
 }
 
@@ -335,6 +358,15 @@ impl ItemOutcome {
         (self.body, self.images) = anchored.into_parts();
     }
 
+    /// This item's typed status, as the run envelope carries it.
+    pub(crate) fn status(&self) -> cairn_common::read::RunItemStatus {
+        cairn_common::read::RunItemStatus {
+            exit_code: self.exit_code,
+            ended: self.ended,
+            succeeded: self.succeeded,
+        }
+    }
+
     /// A failed item carrying `header` and `body`, with no image blocks — the
     /// common shape for every error / denial / spawn-failure path.
     pub(super) fn failed(header: String, body: impl Into<String>) -> Self {
@@ -342,6 +374,8 @@ impl ItemOutcome {
             header,
             body: body.into(),
             succeeded: false,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
@@ -439,6 +473,37 @@ mod tests {
             let parsed: WaitFor = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
         }
+    }
+
+    /// A cell item's exit code and how it ended survive the conversion as
+    /// types: an exit, a timeout at its bound, and an executor's cancel.
+    #[test]
+    fn cell_item_status_is_typed_from_the_wire() {
+        use cairn_common::executor_protocol::{CommandStop, ProcessBatchItemOutcome};
+        use cairn_common::read::RunItemEnd;
+        let wire = |exit_code: Option<i32>, timed_out: bool| -> ProcessBatchItemOutcome {
+            serde_json::from_value(serde_json::json!({
+                "header": "cmd", "body": "", "succeeded": false, "suspended": false,
+                "exitCode": exit_code, "timedOut": timed_out,
+                "startedAtUnixMs": 1, "finishedAtUnixMs": 2, "durationMs": 1,
+            }))
+            .unwrap()
+        };
+
+        let exited = ItemOutcome::from(wire(Some(1), false)).status();
+        assert_eq!(exited.exit_code, Some(1));
+        assert_eq!(exited.ended, RunItemEnd::Exited);
+        assert!(!exited.succeeded);
+
+        let timed_out = ItemOutcome::from(wire(None, true)).status();
+        assert_eq!(timed_out.ended, RunItemEnd::TimedOut);
+
+        let mut cancelled = wire(Some(143), false);
+        cancelled.stop = Some(CommandStop::Cancelled);
+        assert_eq!(
+            ItemOutcome::from(cancelled).status().ended,
+            RunItemEnd::Cancelled
+        );
     }
 
     /// A cell reports its batch as `ProcessBatchItemOutcome` JSON, which is

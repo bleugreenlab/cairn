@@ -841,7 +841,17 @@ pub(crate) async fn deliver_batch_result(
 ) {
     match durable_suspend::pending_run_batch_wait(db, request_id).await {
         Ok(Some(record)) => {
-            durable_suspend::drive_resolution(orch, db, &record, text, false).await;
+            // The batch's envelope is gone by now; its verdict is what
+            // survives of whether an item failed.
+            let is_error = verdict != detached::SUCCEEDED_VERDICT;
+            durable_suspend::drive_resolution(
+                orch,
+                db,
+                &record,
+                durable_suspend::Answer::new(text, is_error),
+                false,
+            )
+            .await;
             detached::settle_after_park(orch, db, request_id, verdict, text).await;
         }
         Ok(None) => {
@@ -914,7 +924,9 @@ pub(crate) fn release_text(handle: &str, machines: &[String], commits: bool) -> 
 
 /// Settle a parked wait with a text of this process's own: resolve it, then
 /// settle the detached row a resolution diverted it into, exactly as a live
-/// resolver does.
+/// resolver does. Every such text says the batch ended without its result
+/// (lost, cancelled, or gone with a restart), so the call answers as a failed
+/// tool result, as a batch the call heard end that way would.
 pub(super) async fn resolve_wait(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -922,7 +934,14 @@ pub(super) async fn resolve_wait(
     request_id: &str,
     text: &str,
 ) {
-    durable_suspend::drive_resolution(orch, db, record, text, false).await;
+    durable_suspend::drive_resolution(
+        orch,
+        db,
+        record,
+        durable_suspend::Answer::new(text, true),
+        false,
+    )
+    .await;
     detached::settle_after_park(
         orch,
         db,

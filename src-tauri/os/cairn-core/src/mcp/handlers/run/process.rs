@@ -163,6 +163,8 @@ async fn run_complete(
                 .as_ref()
                 .map_or_else(|| outcome.text.clone(), serde_json::Value::to_string),
             succeeded: true,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
@@ -217,6 +219,8 @@ async fn run_decide(
             body: serde_json::to_string_pretty(&outcome)
                 .unwrap_or_else(|error| format!("the decision could not be rendered: {error}")),
             succeeded: true,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
@@ -411,6 +415,8 @@ pub(crate) async fn run_one(
                             .parsed
                             .map_or(outcome.text, |value| value.to_string()),
                         succeeded: true,
+                        exit_code: None,
+                        ended: cairn_common::read::RunItemEnd::Exited,
                         suspended: false,
                         images: Vec::new(),
                         tracked_modifications: None,
@@ -579,6 +585,8 @@ pub(crate) async fn run_one(
                                continue once it is answered."
                                 .to_string(),
                             succeeded: false,
+                            exit_code: None,
+                            ended: cairn_common::read::RunItemEnd::Exited,
                             suspended: true,
                             images: Vec::new(),
                             tracked_modifications: None,
@@ -625,6 +633,8 @@ pub(crate) async fn run_one(
         header,
         body,
         succeeded,
+        exit_code: exec.exit_code,
+        ended: super::types::process_ending(exec.timed_out, None),
         suspended: false,
         images: Vec::new(),
         tracked_modifications: None,
@@ -737,6 +747,8 @@ async fn run_mcp_call(
             header,
             body: append_link_affordance(result.text, &result.links, &server),
             succeeded: true,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: result.images,
             tracked_modifications: None,
@@ -918,6 +930,8 @@ async fn run_machine_service_call(
             header,
             body: append_link_affordance(result.text, &result.links, &server),
             succeeded: true,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: result.images,
             tracked_modifications: None,
@@ -1073,7 +1087,7 @@ async fn suspend_mcp_call(
     // persisted handoff delay prevents a first transition until this suspension
     // marker has reached the provider, without retaining a per-call task or
     // receiver in memory.
-    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None, data: None, whole: false }
+    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, exit_code: None, ended: cairn_common::read::RunItemEnd::Exited, suspended: true, images: Vec::new(), tracked_modifications: None, data: None, whole: false }
 }
 
 /// The durable continuation of an MCP call that answered `outcome`.
@@ -1292,6 +1306,8 @@ async fn run_repl_send(
                     header,
                     body,
                     succeeded: matches!(exchange.status, ReplExchangeStatus::Success),
+                    exit_code: None,
+                    ended: cairn_common::read::RunItemEnd::Exited,
                     suspended: false,
                     images: Vec::new(),
                     tracked_modifications: None,

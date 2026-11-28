@@ -72,11 +72,15 @@ pub(crate) const RUN_CANCELLED: &str = "Run cancelled";
 /// Openings that mark a run envelope as a failure of the run itself rather than a
 /// command result.
 ///
-/// A run envelope carries only composed text, so a caller that consumes runs
-/// programmatically — action runs, in [`crate::execution::actions`] — can only
-/// classify an outcome by reading it. That makes this wording a contract between
-/// the two surfaces rather than free prose: reword the constants above, never the
-/// literal at a use site, or a failed run silently reads as a successful one.
+/// A failure composed through [`RunFailure::envelope`] is typed by the
+/// envelope's `batch` status, which is what callers read first
+/// ([`cairn_common::read::RunBatchEnvelope::is_error`]). Some failure texts still
+/// reach an envelope as text only (a lost or abandoned batch's), so a caller
+/// that consumes runs programmatically — action runs, in
+/// [`crate::execution::actions`] — also classifies by these openings. That makes
+/// this wording a contract between the two surfaces rather than free prose:
+/// reword the constants above, never the literal at a use site, or a failed run
+/// silently reads as a successful one.
 pub(crate) const RUN_FAILURE_OPENINGS: &[&str] = &[
     RUN_NOT_EXECUTED,
     RUN_OUTCOME_UNKNOWN,
@@ -199,6 +203,26 @@ fn what_a_lost_batch_landed(commits: bool) -> &'static str {
 }
 
 impl RunFailure {
+    /// The batch's typed status: how it ended without its items' results.
+    pub(crate) fn status(&self) -> cairn_common::read::RunItemStatus {
+        use cairn_common::read::{RunItemEnd, RunItemStatus};
+        RunItemStatus::failed(match self {
+            Self::NotExecuted(_) => RunItemEnd::NotRun,
+            Self::Unaccounted(_)
+            | Self::DispatchedWithoutResult(_)
+            | Self::LostToRestart { .. }
+            | Self::LostWithProcess { .. } => RunItemEnd::Lost,
+            // Its commands ran to their end; only their result did not land.
+            Self::NotPublished(_) => RunItemEnd::Exited,
+            Self::Cancelled(_) => RunItemEnd::Cancelled,
+        })
+    }
+
+    /// The whole answer for a batch that ended this way.
+    pub(crate) fn envelope(&self) -> String {
+        failure_envelope(self.text(), self.status())
+    }
+
     /// The agent-facing text, always opening with one of [`RUN_FAILURE_OPENINGS`].
     pub(crate) fn text(&self) -> String {
         match self {
@@ -6385,10 +6409,11 @@ fn finalize_delta_receipt(
     orch.object_plane.consume_staged_delta(receipt)
 }
 
+use cairn_common::read::run_failure_summary as failure_summary;
 use hygiene::check_cd_commands;
 use output::{
-    collect_run_data, compose_run_output, run_budget_for, run_envelope, run_envelope_with_data,
-    run_input_refusal, RunOutputBudget,
+    collect_run_data, compose_run_output, failure_envelope, item_statuses, run_budget_for,
+    run_envelope, run_envelope_with_data, run_input_refusal, RunOutputBudget,
 };
 use process::run_one;
 pub(crate) use process::READ_ONLY_CHECKOUT_DENIAL;
@@ -7236,14 +7261,11 @@ async fn prepare_and_run_batch(
         // The dispatch gate already refused these; the batch's own guarantee
         // is that nothing in the payload chooses a tree or a machine for it.
         if payload.branch.is_some() || payload.executor.is_some() {
-            return run_envelope(
-                RunFailure::NotExecuted(
-                    "a page-call batch runs against no branch and on no machine its caller names."
-                        .to_string(),
-                )
-                .text(),
-                Vec::new(),
-            );
+            return RunFailure::NotExecuted(
+                "a page-call batch runs against no branch and on no machine its caller names."
+                    .to_string(),
+            )
+            .envelope();
         }
         BatchCoordinate {
             branch: None,
@@ -7281,13 +7303,10 @@ async fn prepare_and_run_batch(
                 |key| crate::project_services::supervisor::machine::instances(orch, key),
                 &snapshot.machines,
             ) {
-                return run_envelope(
-                    RunFailure::NotExecuted(format!(
-                        "its machine-service calls could not be routed to a machine:\n{refusals}\n"
-                    ))
-                    .text(),
-                    Vec::new(),
-                );
+                return RunFailure::NotExecuted(format!(
+                    "its machine-service calls could not be routed to a machine:\n{refusals}\n"
+                ))
+                .envelope();
             }
         }
     }
@@ -7394,11 +7413,19 @@ async fn prepare_and_run_batch(
         {
             read_equivalent::BatchRoute::Served(outcomes) => {
                 let composed = compose_run_output(&outcomes, run_budget_for(request));
+                let items = item_statuses(&outcomes, resolved.len());
+                let mut output = composed.output();
+                if let Some(summary) = failure_summary(&items) {
+                    output.prepend(&format!("{summary}\n\n"));
+                }
+                let (text, images) = output.into_parts();
                 return run_envelope_with_data(
-                    composed.text,
-                    composed.images,
+                    text,
+                    images,
                     None,
                     composed.over_ceiling,
+                    items,
+                    None,
                 );
             }
             read_equivalent::BatchRoute::Machine(notes) => notes
@@ -7549,12 +7576,10 @@ async fn prepare_and_run_batch(
                 None => format!("{refusal}."),
             };
             let detail = selector::with_default_suffix(node_default.as_ref(), detail);
-            return run_envelope(
-                selector::with_clear_notice(
-                    default_clear_notice.as_deref(),
-                    RunFailure::NotExecuted(detail).text(),
-                ),
-                Vec::new(),
+            let failure = RunFailure::NotExecuted(detail);
+            return failure_envelope(
+                selector::with_clear_notice(default_clear_notice.as_deref(), failure.text()),
+                failure.status(),
             );
         }
     };
@@ -7648,15 +7673,12 @@ async fn prepare_and_run_batch(
         None
     };
     if has_process && slot_target.is_none() {
-        return run_envelope(
-            selector::with_clear_notice(
-                default_clear_notice.as_deref(),
-                RunFailure::NotExecuted(
-                    "this batch's working directory could not be resolved.".to_string(),
-                )
-                .text(),
-            ),
-            Vec::new(),
+        let failure = RunFailure::NotExecuted(
+            "this batch's working directory could not be resolved.".to_string(),
+        );
+        return failure_envelope(
+            selector::with_clear_notice(default_clear_notice.as_deref(), failure.text()),
+            failure.status(),
         );
     }
     if has_process {
@@ -7821,6 +7843,7 @@ async fn prepare_and_run_batch(
                 hermetic_pin: None,
                 template,
             };
+            let item_count = resolved.len();
             let batch = ResolvedRunBatch {
                 request: request.clone(),
                 run_context: run_context.clone(),
@@ -7857,6 +7880,7 @@ async fn prepare_and_run_batch(
                 marker_escape: marker_escape.clone(),
                 machine_notes,
                 prior_publication_since_ms: None,
+                item_count,
             };
             return off_frame(|| {
                 run_routed_batch(orch, settlement, placement, batch, control, deadlines)
@@ -7868,6 +7892,7 @@ async fn prepare_and_run_batch(
     // Everything below runs on the host: MCP gateway calls, REPL sends, model
     // calls, and items that failed to resolve. Tree-bound shell and script items
     // never reach here — a process batch that cannot be placed is refused above.
+    let item_count = resolved.len();
     let batch = HostBatch {
         request: request.clone(),
         cwd: cwd.clone(),
@@ -7902,6 +7927,7 @@ async fn prepare_and_run_batch(
         default_clear_notice: None,
         machine_notes,
         prior_publication_since_ms: None,
+        item_count,
     };
     let suspendable = batch.may_outlive_grace();
     off_frame(|| run_host_batch(orch, settlement, batch, control, deadlines, suspendable)).await
@@ -8076,6 +8102,8 @@ fn settled_envelope(settled: SettledRunBatch) -> String {
         settled.images,
         settled.data,
         settled.over_ceiling,
+        settled.items,
+        settled.batch,
     )
 }
 
@@ -8645,6 +8673,10 @@ struct RunBatchSettlement {
     /// an earlier one may already have published: before landing, look for a
     /// landing recorded under this batch's key since this instant.
     prior_publication_since_ms: Option<i64>,
+    /// How many items the batch holds, so an item a sequential batch stopped
+    /// before still has a status. Zero when it is not known (a settlement
+    /// rebuilt after a restart), and then only the items that reported do.
+    item_count: usize,
 }
 
 /// The immutable input and the branch state observed when its result settled.
@@ -8958,6 +8990,7 @@ impl RunBatchSettlement {
             default_clear_notice: persisted.default_clear_notice.clone(),
             machine_notes: persisted.machine_notes.clone(),
             prior_publication_since_ms: Some(started_ms),
+            item_count: 0,
         };
         let residence = if persisted.detached {
             BatchResidence::Detached
@@ -8987,10 +9020,14 @@ struct SettledRunBatch {
     /// One phrase for how the batch ended, which a detached batch's notice
     /// states: "succeeded", "2 of 3 items failed", or the run's own failure.
     verdict: String,
+    /// Each item's typed status ([`cairn_common::read::RunBatchEnvelope::items`]).
+    items: Vec<cairn_common::read::RunItemStatus>,
+    /// The batch's own status when it ended without its items.
+    batch: Option<cairn_common::read::RunItemStatus>,
 }
 
 impl SettledRunBatch {
-    fn failure(text: String) -> Self {
+    fn failure(text: String, status: cairn_common::read::RunItemStatus) -> Self {
         Self {
             verdict: detached::verdict_from_text(&text),
             text,
@@ -8998,6 +9035,8 @@ impl SettledRunBatch {
             data: None,
             over_ceiling: None,
             suspended: false,
+            items: Vec::new(),
+            batch: Some(status),
         }
     }
 
@@ -9009,18 +9048,29 @@ impl SettledRunBatch {
             over_ceiling: None,
             suspended: true,
             verdict: "suspended on an item's own approval".into(),
+            items: Vec::new(),
+            batch: None,
         }
     }
 
     /// A batch that ran to `output` (its text with the items' images placed
-    /// in it), carrying its items' data.
-    fn settled(output: cairn_common::read::AnchoredText, mut outcomes: Vec<ItemOutcome>) -> Self {
+    /// in it), carrying its items' data and statuses. A batch with a failed
+    /// item opens with the line naming it, ahead of everything else.
+    fn settled(
+        mut output: cairn_common::read::AnchoredText,
+        mut outcomes: Vec<ItemOutcome>,
+        item_count: usize,
+    ) -> Self {
         let failed = outcomes.iter().filter(|outcome| !outcome.succeeded).count();
         let verdict = match (failed, outcomes.len()) {
-            (0, _) => "succeeded".to_string(),
+            (0, _) => detached::SUCCEEDED_VERDICT.to_string(),
             (1, 1) => "failed".to_string(),
             (failed, total) => format!("{failed} of {total} items failed"),
         };
+        let items = item_statuses(&outcomes, item_count);
+        if let Some(summary) = failure_summary(&items) {
+            output.prepend(&format!("{summary}\n\n"));
+        }
         let (text, images) = output.into_parts();
         Self {
             text,
@@ -9029,12 +9079,97 @@ impl SettledRunBatch {
             over_ceiling: None,
             suspended: false,
             verdict,
+            items,
+            batch: None,
         }
     }
 
     fn with_over_ceiling(mut self, over_ceiling: Option<cairn_common::read::OverCeiling>) -> Self {
         self.over_ceiling = over_ceiling;
         self
+    }
+}
+
+#[cfg(test)]
+mod item_status_tests {
+    use super::*;
+    use cairn_common::read::{AnchoredText, RunBatchEnvelope, RunItemEnd};
+
+    fn item(exit_code: i32) -> ItemOutcome {
+        ItemOutcome {
+            succeeded: exit_code == 0,
+            exit_code: Some(exit_code),
+            ..ItemOutcome::failed("cmd".to_string(), "out")
+        }
+    }
+
+    const RAN_ON: &str = "Ran on **bbs** (linux). Took 1s.\n\nout\n\nExit code: 1";
+
+    fn settle(outcomes: Vec<ItemOutcome>, item_count: usize) -> RunBatchEnvelope {
+        let settled = SettledRunBatch::settled(
+            AnchoredText::new(RAN_ON.to_string(), Vec::new()),
+            outcomes,
+            item_count,
+        );
+        serde_json::from_str(&settled_envelope(settled)).unwrap()
+    }
+
+    #[test]
+    fn an_item_that_exits_one_fails_the_call_and_leads_the_text() {
+        let envelope = settle(vec![item(1)], 1);
+        assert!(envelope.is_error());
+        assert_eq!(envelope.items[0].exit_code, Some(1));
+        assert_eq!(envelope.items[0].ended, RunItemEnd::Exited);
+        assert_eq!(
+            envelope.text,
+            format!("1 of 1 item failed: item 1 exited 1.\n\n{RAN_ON}")
+        );
+        // The parked path answers from the same envelope by the same rule.
+        let answer = BatchAnswer::from_envelope(serde_json::to_string(&envelope).unwrap());
+        assert!(answer.is_error);
+        assert!(answer.resume_text.starts_with("1 of 1 item failed"));
+    }
+
+    #[test]
+    fn one_failure_in_a_batch_is_named_by_its_position() {
+        let envelope = settle(vec![item(0), item(2)], 2);
+        assert!(envelope.is_error());
+        assert!(envelope
+            .text
+            .starts_with("1 of 2 items failed: item 2 exited 2.\n\nRan on"));
+        assert!(envelope.items[0].succeeded);
+        assert_eq!(envelope.items[1].exit_code, Some(2));
+    }
+
+    #[test]
+    fn an_all_success_batch_opens_as_it_always_did() {
+        let envelope = settle(vec![item(0), item(0)], 2);
+        assert!(!envelope.is_error());
+        assert_eq!(envelope.text, RAN_ON);
+        assert_eq!(envelope.items.len(), 2);
+        assert!(!BatchAnswer::from_envelope(serde_json::to_string(&envelope).unwrap()).is_error);
+    }
+
+    #[test]
+    fn items_a_stopped_sequential_batch_never_started_are_reported_as_not_run() {
+        let envelope = settle(vec![item(1)], 3);
+        assert_eq!(envelope.items.len(), 3);
+        assert_eq!(envelope.items[2].ended, RunItemEnd::NotRun);
+        assert!(envelope
+            .text
+            .starts_with("1 of 3 items failed: item 1 exited 1; item 2, item 3 did not run."));
+    }
+
+    #[test]
+    fn a_batch_that_ended_without_its_items_is_typed_by_its_failure() {
+        let cancelled: RunBatchEnvelope =
+            serde_json::from_str(&RunFailure::Cancelled(None).envelope()).unwrap();
+        assert!(cancelled.is_error());
+        assert!(cancelled.items.is_empty());
+        assert_eq!(cancelled.batch.unwrap().ended, RunItemEnd::Cancelled);
+        let lost: RunBatchEnvelope =
+            serde_json::from_str(&RunFailure::LostToRestart { commits: false }.envelope()).unwrap();
+        assert_eq!(lost.batch.unwrap().ended, RunItemEnd::Lost);
     }
 }
 
@@ -9332,8 +9467,28 @@ fn settled_failure_text(
     ceiling: Option<String>,
     notes: &PlacementNotes,
 ) -> Option<String> {
-    let text =
-        failure_without_result(handle, outcome, grant_without_result, commits, ceiling)?.text();
+    settled_failure(
+        handle,
+        outcome,
+        grant_without_result,
+        commits,
+        ceiling,
+        notes,
+    )
+    .map(|(text, _)| text)
+}
+
+/// [`settled_failure_text`] with the failure's typed status beside it.
+fn settled_failure(
+    handle: &str,
+    outcome: &CellOutcome,
+    grant_without_result: Option<crate::fleet::GrantWithoutResult>,
+    commits: bool,
+    ceiling: Option<String>,
+    notes: &PlacementNotes,
+) -> Option<(String, cairn_common::read::RunItemStatus)> {
+    let failure = failure_without_result(handle, outcome, grant_without_result, commits, ceiling)?;
+    let (text, status) = (failure.text(), failure.status());
     let note = match outcome {
         CellOutcome::FailedAfterExecution { .. } | CellOutcome::Completed { .. } => {
             [notes.ran_on.clone(), notes.executed()]
@@ -9345,10 +9500,11 @@ fn settled_failure_text(
         | CellOutcome::StorageFailure { .. }
         | CellOutcome::Cancelled { .. } => notes.claimed(),
     };
-    Some(match note {
+    let text = match note {
         Some(note) => format!("{text}\n\n{note}"),
         None => text,
-    })
+    };
+    Some((text, status))
 }
 
 /// What the placement task produced, and whether any attempt along the way was
@@ -10789,6 +10945,10 @@ struct BatchAnswer {
     envelope: String,
     /// What a durable resume carries: text only.
     resume_text: String,
+    /// Whether the answer is a failed tool result
+    /// ([`cairn_common::read::RunBatchEnvelope::is_error`]), which a durable
+    /// resume records beside its text so it answers as the call would have.
+    is_error: bool,
     /// An item's own suspension (a fence approval, an MCP continuation) owns
     /// the call now; nothing else may answer it.
     item_suspended: bool,
@@ -10801,9 +10961,12 @@ struct BatchAnswer {
 impl BatchAnswer {
     fn from_envelope(envelope: String) -> Self {
         let parsed = serde_json::from_str::<cairn_common::read::RunBatchEnvelope>(&envelope).ok();
-        let (text, images) = match parsed {
-            Some(parsed) => (parsed.text, parsed.images.len()),
-            None => (envelope.clone(), 0),
+        let (text, images, is_error) = match parsed {
+            Some(parsed) => {
+                let is_error = parsed.is_error();
+                (parsed.text, parsed.images.len(), is_error)
+            }
+            None => (envelope.clone(), 0, false),
         };
         let item_suspended = text == RUN_ITEM_SUSPENDED_MARKER;
         let mut resume_text = text;
@@ -10818,6 +10981,7 @@ impl BatchAnswer {
         Self {
             envelope,
             resume_text,
+            is_error,
             item_suspended,
             _result_ack: None,
         }
@@ -10825,10 +10989,10 @@ impl BatchAnswer {
 
     /// The answer for a batch task that ended without producing one.
     fn task_failed() -> Self {
-        Self::from_envelope(run_envelope(
-            RunFailure::Unaccounted("its batch task ended without an answer.".to_string()).text(),
-            Vec::new(),
-        ))
+        Self::from_envelope(
+            RunFailure::Unaccounted("its batch task ended without an answer.".to_string())
+                .envelope(),
+        )
     }
 
     /// One line for the log when nobody is left to read this answer.
@@ -11180,7 +11344,14 @@ fn spawn_parked_resolver(
         // A permission that took this call over but did not suspend the item is
         // being withdrawn, and its withdrawal hands this row back.
         durable_suspend::await_inner_wait_release(&db, &record).await;
-        durable_suspend::drive_resolution(&orch, &db, &record, &answer.resume_text, false).await;
+        durable_suspend::drive_resolution(
+            &orch,
+            &db,
+            &record,
+            durable_suspend::Answer::new(&answer.resume_text, answer.is_error),
+            false,
+        )
+        .await;
         control
             .ledger
             .end(ledger::End::Resumed, None, Some(answer.resume_text.len()));
@@ -11892,12 +12063,11 @@ impl CallAnswer {
     /// until the deadline, and the call says exactly what that left behind.
     async fn cancel_in_time(&mut self, reason: &str) -> String {
         if self.control.abandon(&self.orch) {
-            let text = RunFailure::Cancelled(Some(format!(
+            let failure = RunFailure::Cancelled(Some(format!(
                 "Cairn could not park this call ({reason}) or record it to finish on its own, so it cancelled the batch; nothing from it was committed. Lifecycle: `{}`.",
                 self.control.handle(),
-            )))
-            .text();
-            return self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()));
+            )));
+            return self.finish(AnswerOutcome::Cancelled, failure.envelope());
         }
         // Settlement had already begun, so the batch's own result is the
         // truest answer if it arrives in time.
@@ -11909,12 +12079,11 @@ impl CallAnswer {
         } else {
             "but it had no commit_msg, so it committed nothing"
         };
-        let text = RunFailure::Cancelled(Some(format!(
+        let failure = RunFailure::Cancelled(Some(format!(
             "Cairn could not park this call ({reason}), and the batch was already publishing its result when the call had to answer, {left}. Lifecycle: `{}`.",
             self.control.handle(),
-        )))
-        .text();
-        self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()))
+        )));
+        self.finish(AnswerOutcome::Cancelled, failure.envelope())
     }
 }
 
@@ -12083,7 +12252,10 @@ async fn settle_joined_batch(
         grant_without_result,
     } = match joined {
         Ok(attempts) => attempts,
-        Err(error) => return SettledRunBatch::failure(placement_task_failure(&error).text()),
+        Err(error) => {
+            let failure = placement_task_failure(&error);
+            return SettledRunBatch::failure(failure.text(), failure.status());
+        }
     };
     let commits = settlement.commit_msg.is_some();
     let refused = |detail: String| {
@@ -12092,9 +12264,8 @@ async fn settle_joined_batch(
             None => detail,
         };
         let detail = selector::with_default_suffix(settlement.node_default.as_ref(), detail);
-        SettledRunBatch::failure(
-            unexecuted_failure(handle, detail, grant_without_result.clone(), commits).text(),
-        )
+        let failure = unexecuted_failure(handle, detail, grant_without_result.clone(), commits);
+        SettledRunBatch::failure(failure.text(), failure.status())
     };
     let mut settled = match placed {
         PlacedBatch::Cell(outcome, residence, notes) => {
@@ -12198,7 +12369,7 @@ async fn settle_routed_run_batch(
             "a capacity-shaped placement failure was settled as a run failure: {diagnostic}"
         );
     }
-    if let Some(text) = settled_failure_text(
+    if let Some((text, status)) = settled_failure(
         handle,
         &outcome,
         grant_without_result,
@@ -12206,11 +12377,10 @@ async fn settle_routed_run_batch(
         ceiling,
         &notes,
     ) {
-        return SettledRunBatch::failure(refusal_under_default(
-            &outcome,
-            settlement.node_default.as_ref(),
-            text,
-        ));
+        return SettledRunBatch::failure(
+            refusal_under_default(&outcome, settlement.node_default.as_ref(), text),
+            status,
+        );
     }
     let CellOutcome::Completed {
         attempt_id,
@@ -12265,10 +12435,9 @@ async fn settle_routed_run_batch(
         Err(error) => {
             // The commands ran; only their result is unreadable, so this is a
             // publication failure and must classify as one.
-            return SettledRunBatch::failure(
-                RunFailure::NotPublished(format!("their result could not be read back ({error})."))
-                    .text(),
-            );
+            let failure =
+                RunFailure::NotPublished(format!("their result could not be read back ({error})."));
+            return SettledRunBatch::failure(failure.text(), failure.status());
         }
     };
     let notes = PlacementNotes {
@@ -12391,7 +12560,8 @@ pub(crate) fn compose_adopted_result(
     }
     composed.prepend(&format!("{}\n\n", adopted_ran_on(machine)));
     let Some(reason) = unpublished else {
-        let settled = SettledRunBatch::settled(composed, outcomes);
+        let count = outcomes.len();
+        let settled = SettledRunBatch::settled(composed, outcomes, count);
         let verdict = settled.verdict.clone();
         return (
             BatchAnswer::from_envelope(settled_envelope(settled)).resume_text,
@@ -12808,7 +12978,8 @@ async fn settle_run_batch(
         if result.is_empty() {
             result.push_str("(no output)");
         }
-        return SettledRunBatch::settled(result, outcomes).with_over_ceiling(over_ceiling);
+        return SettledRunBatch::settled(result, outcomes, s.item_count)
+            .with_over_ceiling(over_ceiling);
     }
 
     // Publish an authenticated cell delta through the runner-owned logical-head
@@ -13152,7 +13323,7 @@ async fn settle_run_batch(
     if result.is_empty() {
         result.push_str("(no output)");
     }
-    SettledRunBatch::settled(result, outcomes).with_over_ceiling(over_ceiling)
+    SettledRunBatch::settled(result, outcomes, s.item_count).with_over_ceiling(over_ceiling)
 }
 
 /// The Cairn environment a placed process carries to whatever machine runs it.
@@ -13350,6 +13521,8 @@ mod tests {
             header: "permission".to_string(),
             body: "executor transport text must not escape".to_string(),
             succeeded: false,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: true,
             images: Vec::new(),
             tracked_modifications: None,
@@ -15107,6 +15280,7 @@ pub(crate) mod host_batch_tests {
             default_clear_notice: None,
             machine_notes: Vec::new(),
             prior_publication_since_ms: None,
+            item_count: 0,
         };
         let batch = HostBatch {
             request: request.clone(),
@@ -15756,6 +15930,8 @@ pub(crate) mod host_batch_tests {
             header: "cargo nextest run".into(),
             body: "x".repeat(200_000),
             succeeded: true,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,

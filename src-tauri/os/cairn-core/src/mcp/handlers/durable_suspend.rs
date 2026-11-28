@@ -2223,14 +2223,14 @@ pub(crate) async fn cancel_run_waits_conn(
 /// call settles last. "Last one out drives" is not a policy choice: a turn
 /// cannot resume while one of its own calls is still unanswered, so it is the
 /// only correct rule.
-pub(crate) async fn resolve(
+pub(crate) async fn resolve<'a>(
     orch: &Orchestrator,
     db: &LocalDb,
     r: &Record,
-    result: &str,
+    result: impl Into<Answer<'a>>,
     replay: bool,
 ) -> Result<(), String> {
-    let outcome = resolve_inner(orch, db, r, result, replay, None).await;
+    let outcome = resolve_inner(orch, db, r, result.into(), replay, None).await;
     // Every exit may follow a terminal state write, including sibling stand-down
     // and diversion to the job. The seam rechecks all branch holds, so an error
     // or a duplicate resolver that left this row active cannot release it early.
@@ -2257,7 +2257,16 @@ pub(crate) async fn resume_queue_wait(
         })
     }).await.map_err(|e| e.to_string())?;
     if let Some((record, Some(result))) = row {
-        resolve_inner(orch, db, &record, &result, true, Some(hold_id)).await?;
+        // The stored answer, error flag included, wins over this one.
+        resolve_inner(
+            orch,
+            db,
+            &record,
+            Answer::from(&result),
+            true,
+            Some(hold_id),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2266,16 +2275,17 @@ async fn resolve_inner(
     orch: &Orchestrator,
     db: &LocalDb,
     r: &Record,
-    result: &str,
+    answer: Answer<'_>,
     replay: bool,
     resolving_hold_id: Option<&str>,
 ) -> Result<(), String> {
+    let result = answer.text;
     // First-writer-wins claim: pending -> resolving. The row count distinguishes
     // the live resolver that won the transition from a duplicate that lost it; a
     // startup replay of an existing `resolving` row re-drives idempotently. A crash
     // from here on leaves a `resolving` row that replay re-drives idempotently
     // instead of losing the resume behind a `resolved` row.
-    let (id, out) = (r.id.clone(), result.to_string());
+    let (id, out, is_error) = (r.id.clone(), result.to_string(), answer.is_error as i64);
     let claimed = db
         .write(|c| {
             let (id, out) = (id.clone(), out.clone());
@@ -2283,8 +2293,8 @@ async fn resolve_inner(
                 let before = wait_now(c, &id).await?;
                 let changed = c
                     .execute(
-                        "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3 WHERE id=?1 AND state='pending'",
-                        params![id.as_str(), out, chrono::Utc::now().timestamp_millis()],
+                        "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3,resolution_is_error=?4 WHERE id=?1 AND state='pending'",
+                        params![id.as_str(), out, chrono::Utc::now().timestamp_millis(), is_error],
                     )
                     .await?;
                 moved_if_changed(c, &before, changed, "resolving").await?;
@@ -2309,6 +2319,12 @@ async fn resolve_inner(
         return Ok(());
     }
     let result = stored_result.as_deref().unwrap_or(result);
+    // The stored flag belongs to the stored text: a replay answers as the
+    // resolver that recorded them would have.
+    let is_error = match stored_result {
+        Some(_) => stored_is_error(db, &r.id).await?,
+        None => answer.is_error,
+    };
 
     // Per-call work, done by every resolver of this turn: answer this call on
     // its own tool use id, exactly once.
@@ -2319,7 +2335,7 @@ async fn resolve_inner(
     // deliberately: a resolver later overtaken by abandonment has already
     // written its REAL result, so the abandonment text loses the delivery claim
     // for that call. A real answer beats "this call's turn was replaced".
-    store_result_once(orch, db, r, result).await?;
+    store_result_once(orch, db, r, Answer::new(result, is_error)).await?;
 
     // A run batch whose turn the job has already moved past (its call was held
     // inline on a turn that ended, or a later turn ran beside it) must not
@@ -2886,6 +2902,18 @@ async fn load_turn_state(db: &LocalDb, turn_id: &str) -> Result<TurnState, Strin
     .map_err(|e| e.to_string())
 }
 
+/// Whether a row's recorded resolution is a failed tool result.
+async fn stored_is_error(db: &LocalDb, id: &str) -> Result<bool, String> {
+    db.query_one(
+        "SELECT resolution_is_error FROM agent_waits WHERE id=?1",
+        params![id.to_string()],
+        |row| row.i64(0),
+    )
+    .await
+    .map(|flag| flag != 0)
+    .map_err(|e| e.to_string())
+}
+
 async fn load_resolution(
     db: &LocalDb,
     id: &str,
@@ -3103,12 +3131,13 @@ async fn release_result_delivery(db: &LocalDb, id: &str) {
 /// append fails. Split from the claim so the two halves are separately
 /// observable: everything between them is the window a racing writer must not
 /// be able to answer in.
-async fn append_claimed_result(
+async fn append_claimed_result<'a>(
     orch: &Orchestrator,
     db: &LocalDb,
     r: &Record,
-    result: &str,
+    answer: impl Into<Answer<'a>>,
 ) -> Result<(), String> {
+    let answer = answer.into();
     #[cfg(test)]
     if let Some(error) = tests::fail_result_append(&r.id) {
         release_result_delivery(db, &r.id).await;
@@ -3119,8 +3148,8 @@ async fn append_claimed_result(
         &r.run_id,
         &r.session_id,
         &r.tool_use_id,
-        result,
-        false,
+        answer.text,
+        answer.is_error,
         chrono::Utc::now().timestamp() as i32,
         Some(&r.turn_id),
     ) {
@@ -3130,16 +3159,44 @@ async fn append_claimed_result(
     Ok(())
 }
 
-async fn store_result_once(
+async fn store_result_once<'a>(
     orch: &Orchestrator,
     db: &LocalDb,
     r: &Record,
-    result: &str,
+    answer: impl Into<Answer<'a>>,
 ) -> Result<(), String> {
     if !claim_result_delivery(db, &r.id).await? {
         return Ok(());
     }
-    append_claimed_result(orch, db, r, result).await
+    append_claimed_result(orch, db, r, answer).await
+}
+
+/// A suspended call's answer: the text its tool result carries, and whether
+/// that result is a failed one. Only a run batch's answer is ever an error
+/// here, by [`cairn_common::read::RunBatchEnvelope::is_error`]; every other
+/// resolver answers with text, which is an ordinary result.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Answer<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) is_error: bool,
+}
+
+impl<'a> Answer<'a> {
+    pub(crate) fn new(text: &'a str, is_error: bool) -> Self {
+        Self { text, is_error }
+    }
+}
+
+impl<'a> From<&'a str> for Answer<'a> {
+    fn from(text: &'a str) -> Self {
+        Self::new(text, false)
+    }
+}
+
+impl<'a> From<&'a String> for Answer<'a> {
+    fn from(text: &'a String) -> Self {
+        Self::new(text, false)
+    }
 }
 
 /// This host's claim to be the one live resolver of a suspension.
@@ -3195,13 +3252,14 @@ pub(crate) fn live_resolvers(orch: &Orchestrator) -> HashSet<String> {
 /// for the next boot: a parked agent is reached only through its own resolution
 /// (an escalated message ends a `waitFor` park by driving this same path), so a
 /// row stranded in `resolving` strands the agent with it (cairn/5778).
-pub(crate) async fn drive_resolution(
+pub(crate) async fn drive_resolution<'a>(
     orch: &Orchestrator,
     db: &LocalDb,
     record: &Record,
-    result: &str,
+    result: impl Into<Answer<'a>>,
     replay: bool,
 ) {
+    let result = result.into();
     let Some(guard) = claim_resolver(orch, &record.id) else {
         log::info!(
             "suspension {} already has a live resolver in this host; deferring to it",
@@ -3236,7 +3294,7 @@ async fn drive_claimed(
     orch: &Orchestrator,
     db: &LocalDb,
     record: &Record,
-    result: &str,
+    result: Answer<'_>,
     mut replay: bool,
     _guard: &ResolverGuard,
 ) {
@@ -3494,7 +3552,15 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
                 };
                 reclaim_interrupted_delivery(&owned_db, &SuspendedCall::of(&record), None).await;
                 let result = resolution_after_restart(&owned_orch, &owned_db, &record).await;
-                drive_claimed(&owned_orch, &owned_db, &record, &result, true, &guard).await;
+                drive_claimed(
+                    &owned_orch,
+                    &owned_db,
+                    &record,
+                    Answer::from(&result),
+                    true,
+                    &guard,
+                )
+                .await;
             });
         }
     }
@@ -3613,7 +3679,8 @@ async fn redrive_resolving(
     let result = stored_result.unwrap_or_else(|| {
         serde_json::json!({"outcome":"error","error":"wait resolution payload missing"}).to_string()
     });
-    drive_claimed(orch, db, record, &result, true, &guard).await;
+    // A replay: the row's stored answer and its error flag stand.
+    drive_claimed(orch, db, record, Answer::from(&result), true, &guard).await;
 }
 
 /// How long a suspension may sit in `resolving` before it counts as stuck.
@@ -8151,6 +8218,76 @@ mod tests {
 
     const ELAPSED: &str = r#"{"outcome":"elapsed","elapsedMs":1,"deadlineMs":1}"#;
     const EXITED: &str = r#"{"outcome":"exited","terminal":"t","exitCode":0}"#;
+
+    /// Each delivered tool result's `isError`, in order.
+    async fn tool_result_errors(orch: &Orchestrator) -> Vec<bool> {
+        tool_results(orch)
+            .await
+            .into_iter()
+            .map(|(_, data)| {
+                let event: serde_json::Value = serde_json::from_str(&data).unwrap();
+                event
+                    .get("isError")
+                    .or_else(|| event.get("is_error"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// A parked batch whose item failed answers its resumed call as a failed
+    /// tool result, as the call would have answered had it not parked; an
+    /// ordinary resolution stays an ordinary result.
+    #[tokio::test]
+    async fn a_resumed_answer_carries_its_error_flag() {
+        let (orch, record, _) = durable_env().await;
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        resolve(
+            &orch,
+            &orch.db.local,
+            &record,
+            Answer::new("1 of 1 item failed: item 1 exited 1.", true),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tool_result_errors(&orch).await, vec![true]);
+        assert!(stored_is_error(&orch.db.local, &record.id).await.unwrap());
+
+        let (orch, record, _) = durable_env().await;
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        resolve(&orch, &orch.db.local, &record, ELAPSED, false)
+            .await
+            .unwrap();
+        assert_eq!(tool_result_errors(&orch).await, vec![false]);
+    }
+
+    /// A delivery retried from the row's stored resolution keeps the error
+    /// flag recorded with it: the replay passes plain text, and the row wins.
+    #[tokio::test]
+    async fn a_replayed_resolution_keeps_its_recorded_error_flag() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-error-replay".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        arm_result_append_failures(&record.id, 1);
+
+        drive_resolution(
+            &orch,
+            &orch.db.local,
+            &record,
+            Answer::new("Run cancelled before it finished.", true),
+            false,
+        )
+        .await;
+
+        assert_eq!(tool_result_errors(&orch).await, vec![true]);
+    }
 
     #[tokio::test]
     async fn durable_duration_resolves_once_with_single_successor_and_resumes_warm() {

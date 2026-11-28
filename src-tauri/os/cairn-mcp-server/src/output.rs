@@ -899,6 +899,8 @@ mod tests {
             invalid_input: false,
             data: None,
             over_ceiling: None,
+            items: Vec::new(),
+            batch: None,
         };
         let serialized = serde_json::to_string(&envelope).unwrap();
         let parsed: RunBatchEnvelope = serde_json::from_str(&serialized).unwrap();

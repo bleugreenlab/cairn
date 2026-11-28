@@ -345,7 +345,7 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
 
 Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out, in the same turn whenever it can be. A batch in which every item declares a `timeout` stays open for their parallel maximum or sequential sum (at least the 120-second synchronous window, at most the 6-hour batch ceiling). Only a batch that outlives its window suspends: one with an item that omits `timeout` after 120 seconds, or a declared one past its sum; it resumes with the finished result. A batch that outlives its window but whose call cannot suspend (a call nested in another tool's cell, or one whose wait could not be recorded in time) keeps running instead of being cancelled: the call answers with a `cairn:~/batches/<id>` handle, Cairn delivers the batch's result to this job as a notice when it settles, and the batch must not be re-run. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch. An MCP-tool item runs to its declared `timeout` under the same ceiling and suspends the same way; without one it keeps the MCP gateway's 30-second default, so declare `timeout` on a tool call you know runs long. Stopping the run cancels an in-flight MCP request. A `cairn.run` of a response or MCP-tool item from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. REPL, decide (`cairn://models/decide`), and embed (`cairn://models/embed`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds; a complete (`cairn://models/complete`) item runs like a response item.
 
-If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes persist across its items and are discarded once when the batch ends (its `$TMPDIR` is still the node's scratch, so writes there persist), and commit_msg, MCP, and REPL items are rejected. A branch a live job owns (by name or node URI, yours or another agent's) is first carried onto its own base once, and the batch runs on that one captured commit; a conflict there installs nothing, wakes no one, and is reported as `conflicts with base` with the paths, not as a test verdict. A commit id, the default branch, and any ref no job owns are exact snapshots that are never carried, and a commit id equal to a managed branch's head is still exact. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. On a batch of machine-service MCP calls (a server many machines run, such as `cairn://mcp/axon/<tool>` for desktop automation) `executor:{name}` or `{os}` instead chooses which machine serves every call in the batch: it may be omitted when exactly one machine serves the server, is required when several do, and the node default never chooses it; read `cairn://mcp/<server>` for each machine's tools. Every result's first line names the machine the batch ran on. A node may set a default machine with `write cairn:~ patch {executor:{...}}`; a call that names none inherits it (the result says `(node default)`), and sub-agent tasks and check lanes never do.
+If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes persist across its items and are discarded once when the batch ends (its `$TMPDIR` is still the node's scratch, so writes there persist), and commit_msg, MCP, and REPL items are rejected. A branch a live job owns (by name or node URI, yours or another agent's) is first carried onto its own base once, and the batch runs on that one captured commit; a conflict there installs nothing, wakes no one, and is reported as `conflicts with base` with the paths, not as a test verdict. A commit id, the default branch, and any ref no job owns are exact snapshots that are never carried, and a commit id equal to a managed branch's head is still exact. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. On a batch of machine-service MCP calls (a server many machines run, such as `cairn://mcp/axon/<tool>` for desktop automation) `executor:{name}` or `{os}` instead chooses which machine serves every call in the batch: it may be omitted when exactly one machine serves the server, is required when several do, and the node default never chooses it; read `cairn://mcp/<server>` for each machine's tools. Every result's first line names the machine the batch ran on, unless an item failed: then the result is `isError:true` and its first line names each failed item ahead of that (`1 of 2 items failed: item 2 exited 1.`). A failed item is a non-zero exit, a timeout, a kill, a cancel, or a loss; `structuredContent.items[i]` carries each item's `{exitCode, ended, succeeded}` (`ended`: exited, timedOut, killed, cancelled, lost, notRun) and `structuredContent.batch` a batch that ended without its items, so code reads the status instead of the text. A node may set a default machine with `write cairn:~ patch {executor:{...}}`; a call that names none inherits it (the result says `(node default)`), and sub-agent tasks and check lanes never do.
 
 A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#,
         meta = run_tool_meta()
@@ -407,21 +407,101 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
                     input.commit_msg.as_deref(),
                 ));
             }
-            Err(_) => RunBatchEnvelope {
-                text: outcome.result.clone(),
-                images: Vec::new(),
-                invalid_input: false,
-                data: None,
-                over_ceiling: None,
-            },
+            Err(_) => RunBatchEnvelope::text(outcome.result.clone()),
         };
-        // Core composes the text within its own cap, and a model door's reply
-        // must arrive whole, so the edge passes it through untouched.
-        let blocks = tool_result_blocks(envelope.text, envelope.images, &outcome.reminders);
-        if envelope.invalid_input {
-            return Ok(CallToolResult::error(blocks));
+        Ok(run_tool_result(envelope, &outcome.reminders))
+    }
+}
+
+/// A run batch's answer as an MCP tool result. `isError` is the envelope's
+/// one rule ([`RunBatchEnvelope::is_error`]): a malformed call, or an item or
+/// batch that did not succeed. Each item's typed status rides in
+/// `structuredContent.items`, so code reads `items[i].exitCode` instead of
+/// the text. Core composes the text within its own cap, and a model door's
+/// reply must arrive whole, so the edge passes the text through untouched.
+fn run_tool_result(envelope: RunBatchEnvelope, reminders: &[String]) -> CallToolResult {
+    let is_error = envelope.is_error();
+    let structured = envelope.structured_content();
+    let blocks = tool_result_blocks(envelope.text, envelope.images, reminders);
+    let mut result = if is_error {
+        CallToolResult::error(blocks)
+    } else {
+        CallToolResult::success(blocks)
+    };
+    result.structured_content = structured;
+    result
+}
+
+#[cfg(test)]
+mod run_result_tests {
+    use super::*;
+    use cairn_common::read::{RunItemEnd, RunItemStatus};
+
+    fn status(exit_code: Option<i32>, ended: RunItemEnd) -> RunItemStatus {
+        RunItemStatus {
+            exit_code,
+            ended,
+            succeeded: exit_code == Some(0),
         }
-        Ok(CallToolResult::success(blocks))
+    }
+
+    #[test]
+    fn an_item_that_exits_one_is_an_error_with_its_exit_code_typed() {
+        let envelope = RunBatchEnvelope {
+            items: vec![
+                status(Some(0), RunItemEnd::Exited),
+                status(Some(1), RunItemEnd::Exited),
+            ],
+            ..RunBatchEnvelope::text("1 of 2 items failed: item 2 exited 1.\n\nRan on x.".into())
+        };
+        let result = run_tool_result(envelope, &[]);
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("statuses are structured");
+        assert_eq!(structured["items"][1]["exitCode"], 1);
+        assert_eq!(structured["items"][1]["ended"], "exited");
+        assert_eq!(structured["items"][0]["succeeded"], true);
+        let text = result.content[0].as_text().unwrap();
+        assert!(text.text.starts_with("1 of 2 items failed"));
+    }
+
+    #[test]
+    fn a_timeout_and_a_lost_batch_are_errors() {
+        let timed_out = RunBatchEnvelope {
+            items: vec![status(None, RunItemEnd::TimedOut)],
+            ..RunBatchEnvelope::text("timed out".into())
+        };
+        let result = run_tool_result(timed_out, &[]);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["items"][0]["ended"],
+            "timedOut"
+        );
+        let lost = RunBatchEnvelope {
+            batch: Some(RunItemStatus::failed(RunItemEnd::Lost)),
+            ..RunBatchEnvelope::text("lost".into())
+        };
+        let result = run_tool_result(lost, &[]);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.unwrap()["batch"]["ended"], "lost");
+    }
+
+    #[test]
+    fn a_successful_or_untyped_batch_is_not_an_error() {
+        let ok = RunBatchEnvelope {
+            items: vec![status(Some(0), RunItemEnd::Exited)],
+            ..RunBatchEnvelope::text("ok".into())
+        };
+        let result = run_tool_result(ok, &[]);
+        assert_eq!(result.is_error, Some(false));
+        assert!(result.structured_content.is_some());
+        let refusal = run_tool_result(RunBatchEnvelope::text("no items".into()), &[]);
+        assert_eq!(refusal.is_error, Some(false));
+        assert_eq!(refusal.structured_content, None);
+        let malformed = RunBatchEnvelope {
+            invalid_input: true,
+            ..RunBatchEnvelope::text("bad shape".into())
+        };
+        assert_eq!(run_tool_result(malformed, &[]).is_error, Some(true));
     }
 }
 

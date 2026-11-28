@@ -1210,6 +1210,9 @@ fn served_outcome(
         header,
         body,
         succeeded: status == 0,
+        // The status of the command this read stands in for.
+        exit_code: Some(status),
+        ended: cairn_common::read::RunItemEnd::Exited,
         suspended: false,
         images,
         tracked_modifications: None,
@@ -1802,6 +1805,8 @@ mod tests {
     fn a_sequential_stop_on_error_batch_stops_after_its_first_failure() {
         let ok = |header: &str| ItemOutcome {
             succeeded: true,
+            exit_code: None,
+            ended: cairn_common::read::RunItemEnd::Exited,
             ..ItemOutcome::failed(header.to_string(), "")
         };
         let outcomes = vec![

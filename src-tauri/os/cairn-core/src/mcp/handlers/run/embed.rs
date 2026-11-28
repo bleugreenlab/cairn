@@ -147,6 +147,8 @@ pub(super) async fn run_embed(
         ),
         body,
         succeeded: true,
+        exit_code: None,
+        ended: cairn_common::read::RunItemEnd::Exited,
         suspended: false,
         images: Vec::new(),
         tracked_modifications: None,

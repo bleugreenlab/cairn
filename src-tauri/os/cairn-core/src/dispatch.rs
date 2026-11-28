@@ -1794,6 +1794,8 @@ mod placed_image_redaction_tests {
             invalid_input: false,
             data: None,
             over_ceiling: None,
+            items: Vec::new(),
+            batch: None,
         };
         let mut output = DispatchOutput {
             content: serde_json::to_string(&envelope).unwrap(),
@@ -1846,6 +1848,8 @@ mod placed_image_redaction_tests {
                 invalid_input: false,
                 data: None,
                 over_ceiling: None,
+                items: Vec::new(),
+                batch: None,
             })
             .unwrap(),
         ] {

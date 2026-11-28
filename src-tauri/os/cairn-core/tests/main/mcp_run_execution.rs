@@ -99,13 +99,18 @@ async fn read_shaped_items_are_served_as_labeled_reads_without_any_executor() {
         ("cat missing.txt", Some(1)),
     ] {
         let text = run(one_command(command)).await;
-        assert!(text.starts_with("↳ read "), "{command} is served: {text}");
         match status {
+            // A failed item leads the result with the line naming it.
             Some(code) => assert!(
-                text.ends_with(&format!("Exit code: {code}")),
-                "{command} should exit {code}: {text}"
+                text.starts_with(&format!(
+                    "1 of 1 item failed: item 1 exited {code}.\n\n↳ read "
+                )) && text.ends_with(&format!("Exit code: {code}")),
+                "{command} should be served and exit {code}: {text}"
             ),
-            None => assert!(!text.contains("Exit code"), "{command} exits 0: {text}"),
+            None => assert!(
+                text.starts_with("↳ read ") && !text.contains("Exit code"),
+                "{command} is served and exits 0: {text}"
+            ),
         }
     }
 

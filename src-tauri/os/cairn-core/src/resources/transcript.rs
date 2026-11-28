@@ -1153,6 +1153,14 @@ fn run_rows(call: &ToolCall, _ctx: &RowContext) -> Vec<DigestRow> {
     let error_detail = result
         .filter(|r| r.is_error)
         .map(|r| first_result_line(&r.content));
+    // A failed call fails per item: its opening line names which. A failure
+    // with no such line (a malformed call, a lost batch) is the call's own,
+    // shown once on the first row.
+    let failed_items: Vec<usize> = result
+        .filter(|r| r.is_error)
+        .map(|r| cairn_common::read::failed_run_items(&r.content).unwrap_or_else(|| vec![0]))
+        .unwrap_or_default();
+    let first_failed = failed_items.iter().min().copied();
 
     if let Some(commands) = input
         .as_object()
@@ -1165,7 +1173,8 @@ fn run_rows(call: &ToolCall, _ctx: &RowContext) -> Vec<DigestRow> {
         let single = commands.len() == 1;
         let mut rows = Vec::new();
         for (index, command) in commands.iter().enumerate() {
-            let metric = if is_error {
+            let failed = failed_items.contains(&index);
+            let metric = if failed {
                 None
             } else if let Some((_, body)) = sections.get(index) {
                 figure_for_run_result(body)
@@ -1175,13 +1184,13 @@ fn run_rows(call: &ToolCall, _ctx: &RowContext) -> Vec<DigestRow> {
                 None
             };
             rows.push(DigestRow {
-                error: is_error && index == 0,
+                error: failed,
                 text: format!(
                     "run {}",
                     single_line_preview(&command_label(command), ROW_LABEL_PREVIEW)
                 ),
                 metric,
-                detail: if is_error && index == 0 {
+                detail: if first_failed == Some(index) {
                     error_detail.clone()
                 } else {
                     None
@@ -1760,6 +1769,40 @@ mod tests {
     use super::*;
     use crate::storage::LocalDb;
     use cairn_common::query::QueryParam;
+
+    /// A failed run call marks the items its opening line names, not item 0;
+    /// a failure with no such line is shown once, on the first row.
+    #[test]
+    fn a_failed_run_marks_the_items_that_failed() {
+        let call = |content: &str| ToolCall {
+            id: "t".into(),
+            name: "run".into(),
+            input: serde_json::json!({"commands":[{"command":"a"},{"command":"b"},{"command":"c"}]}),
+            outcome: Some(ToolOutcome {
+                content: content.into(),
+                is_error: true,
+            }),
+        };
+        let ctx = RowContext {
+            inline_diffs: false,
+        };
+        let rows = run_rows(
+            &call("1 of 3 items failed: item 2 exited 1.\n\n=== a ===\nok\n=== b ===\nboom\n=== c ===\nok"),
+            &ctx,
+        );
+        let errors: Vec<bool> = rows.iter().map(|row| row.error).collect();
+        assert_eq!(errors, [false, true, false]);
+        assert!(rows[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .starts_with("1 of 3 items failed"));
+        assert_eq!(rows[0].detail, None);
+
+        let lost = run_rows(&call("This run's outcome is unknown: lost."), &ctx);
+        let errors: Vec<bool> = lost.iter().map(|row| row.error).collect();
+        assert_eq!(errors, [true, false, false]);
+    }
 
     fn param(key: &str, value: &str) -> QueryParam {
         QueryParam {

@@ -662,6 +662,179 @@ pub struct RunBatchEnvelope {
     /// agent-facing edges never see it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over_ceiling: Option<OverCeiling>,
+    /// Each item's status in input order, an item a sequential batch stopped
+    /// before included; empty when the call ran no items (a refusal, a
+    /// `waitFor`). The MCP edge carries it as `structuredContent.items` and the
+    /// SDKs as their run result's `items`, so a caller reads an item's exit code
+    /// instead of parsing `text`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<RunItemStatus>,
+    /// The batch's own status when it ended as a whole without its items'
+    /// results: never executed, cancelled, or lost with its machine or with
+    /// Cairn. Absent for every batch whose items reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<RunItemStatus>,
+}
+
+impl RunBatchEnvelope {
+    /// A batch answer that is only `text`, with nothing typed beside it.
+    pub fn text(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+            invalid_input: false,
+            data: None,
+            over_ceiling: None,
+            items: Vec::new(),
+            batch: None,
+        }
+    }
+
+    /// Whether this answer is a failed tool result: the call was malformed,
+    /// an item did not succeed (a non-zero exit, its timeout, a kill, a cancel,
+    /// a loss), or the batch ended without its items. This is the one rule;
+    /// the synchronous MCP answer and a parked batch's resumed answer both
+    /// take `isError` from it, so a batch answers the same either way.
+    pub fn is_error(&self) -> bool {
+        self.invalid_input
+            || self.items.iter().any(|item| !item.succeeded)
+            || self.batch.as_ref().is_some_and(|batch| !batch.succeeded)
+    }
+
+    /// The typed statuses as an MCP `structuredContent` object, `None` when
+    /// there are none.
+    pub fn structured_content(&self) -> Option<serde_json::Value> {
+        if self.items.is_empty() && self.batch.is_none() {
+            return None;
+        }
+        let mut object = serde_json::Map::new();
+        object.insert("items".into(), serde_json::json!(self.items));
+        if let Some(batch) = &self.batch {
+            object.insert("batch".into(), serde_json::json!(batch));
+        }
+        Some(serde_json::Value::Object(object))
+    }
+}
+
+/// How a run item ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunItemEnd {
+    /// It ran to its own end: its process exited, or its target answered.
+    Exited,
+    /// It was stopped at its declared `timeout`.
+    TimedOut,
+    /// Its executor ended it: a silent process tree, an out-of-memory kill.
+    Killed,
+    /// It was withdrawn while it ran: a stop or a cancel.
+    Cancelled,
+    /// Its result never came back: its machine, or Cairn, went away under it.
+    Lost,
+    /// It never started: an earlier item stopped its sequential batch, or the
+    /// batch never executed.
+    NotRun,
+}
+
+/// One run item's outcome as a typed fact (see [`RunBatchEnvelope::items`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunItemStatus {
+    /// Its process's exit code, or for a read-served item the status of the
+    /// command it stands in for; `null` for an item with no process (an MCP
+    /// tool, a REPL send, a model door) and for one that never exited.
+    pub exit_code: Option<i32>,
+    pub ended: RunItemEnd,
+    pub succeeded: bool,
+}
+
+impl RunItemStatus {
+    /// The status of something that ended without succeeding or exiting.
+    pub fn failed(ended: RunItemEnd) -> Self {
+        Self {
+            exit_code: None,
+            ended,
+            succeeded: false,
+        }
+    }
+}
+
+/// The opening line a batch with a failed item leads with, naming each one by
+/// its 1-based position: `1 of 2 items failed: item 1 exited 1.`. `None` when
+/// every item succeeded, so such a batch opens exactly as it did before.
+///
+/// It is the one place a stored run tool result says which of its items
+/// failed (the transcript keeps text and a call-level `is_error`, not the
+/// envelope), so [`failed_run_items`] reads it back and the two change together.
+pub fn run_failure_summary(items: &[RunItemStatus]) -> Option<String> {
+    let failed: Vec<String> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !item.succeeded && item.ended != RunItemEnd::NotRun)
+        .map(|(index, item)| format!("item {} {}", index + 1, ending_phrase(item)))
+        .collect();
+    let not_run: Vec<String> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.ended == RunItemEnd::NotRun)
+        .map(|(index, _)| format!("item {}", index + 1))
+        .collect();
+    if failed.is_empty() && not_run.is_empty() {
+        return None;
+    }
+    let mut line = format!(
+        "{} of {} item{} failed",
+        failed.len(),
+        items.len(),
+        if items.len() == 1 { "" } else { "s" }
+    );
+    if !failed.is_empty() {
+        line.push_str(&format!(": {}", failed.join(", ")));
+    }
+    if !not_run.is_empty() {
+        line.push_str(&format!(
+            "{}{} did not run",
+            if failed.is_empty() { ": " } else { "; " },
+            not_run.join(", ")
+        ));
+    }
+    line.push('.');
+    Some(line)
+}
+
+fn ending_phrase(item: &RunItemStatus) -> String {
+    match (item.ended, item.exit_code) {
+        (RunItemEnd::Exited, Some(code)) => format!("exited {code}"),
+        (RunItemEnd::Exited, None) => "failed".to_string(),
+        (RunItemEnd::TimedOut, _) => "timed out".to_string(),
+        (RunItemEnd::Killed, _) => "was killed".to_string(),
+        (RunItemEnd::Cancelled, _) => "was cancelled".to_string(),
+        (RunItemEnd::Lost, _) => "was lost".to_string(),
+        (RunItemEnd::NotRun, _) => "did not run".to_string(),
+    }
+}
+
+/// The 0-based positions of the items a run result's opening
+/// [`run_failure_summary`] line names (failed or never run), or `None` when
+/// the text does not open with one.
+pub fn failed_run_items(text: &str) -> Option<Vec<usize>> {
+    let line = text.lines().next()?;
+    let (head, rest) = line.split_once(" failed")?;
+    let mut words = head.split(' ');
+    let (failed, of, total, noun) = (words.next()?, words.next()?, words.next()?, words.next()?);
+    let counted = failed.parse::<usize>().is_ok() && total.parse::<usize>().is_ok();
+    if !counted || of != "of" || !noun.starts_with("item") || words.next().is_some() {
+        return None;
+    }
+    let mut indices = Vec::new();
+    let mut tokens = rest.split(|c: char| c == ' ' || c == ',' || c == ';' || c == ':');
+    while let Some(token) = tokens.next() {
+        if token == "item" {
+            if let Some(position) = tokens.next().and_then(|n| n.parse::<usize>().ok()) {
+                indices.push(position.saturating_sub(1));
+            }
+        }
+    }
+    Some(indices)
 }
 
 /// The run items a code-facing batch refused to return (see
@@ -1191,5 +1364,46 @@ mod tests {
             serde_json::from_str::<ImageBlock>(&placed).unwrap().at,
             Some(3)
         );
+    }
+}
+
+#[cfg(test)]
+mod run_failure_summary_tests {
+    use super::*;
+
+    fn status(exit_code: Option<i32>, ended: RunItemEnd, succeeded: bool) -> RunItemStatus {
+        RunItemStatus {
+            exit_code,
+            ended,
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn the_summary_reads_back_as_the_items_it_names() {
+        let items = [
+            status(Some(0), RunItemEnd::Exited, true),
+            status(Some(1), RunItemEnd::Exited, false),
+            status(None, RunItemEnd::TimedOut, false),
+            status(None, RunItemEnd::NotRun, false),
+        ];
+        let summary = run_failure_summary(&items).unwrap();
+        assert_eq!(
+            summary,
+            "2 of 4 items failed: item 2 exited 1, item 3 timed out; item 4 did not run."
+        );
+        let text = format!("{summary}\n\nRan on **bbs** (linux). item 9 of the log");
+        assert_eq!(failed_run_items(&text), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn a_batch_that_did_not_fail_has_no_summary_to_read() {
+        assert_eq!(
+            run_failure_summary(&[status(Some(0), RunItemEnd::Exited, true)]),
+            None
+        );
+        assert_eq!(failed_run_items("Ran on **bbs** (linux). Took 1s."), None);
+        assert_eq!(failed_run_items("Run cancelled before it finished."), None);
+        assert_eq!(failed_run_items("3 tests failed"), None);
     }
 }
