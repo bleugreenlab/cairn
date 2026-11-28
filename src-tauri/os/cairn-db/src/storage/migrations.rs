@@ -7965,3 +7965,149 @@ mod camps_conversations_migration_tests {
         }
     }
 }
+
+/// cairn/7751: the production store recorded 0455 as applied while its three
+/// publications triggers still carried 0438's text.
+#[cfg(test)]
+mod publication_triggers_migration_tests {
+    use super::*;
+    use crate::storage::{
+        migrated_test_db, run_integrity_sweep, IntegritySweepOutcome, LocalDb, MigrationRunner,
+        RowExt,
+    };
+
+    const REDEFINED_BY_0455: [&str; 3] = [
+        "publications_identity_immutable",
+        "publication_legs_shadow_never_uploads_insert",
+        "publication_legs_shadow_never_uploads_update",
+    ];
+
+    /// The three triggers as 0438 wrote them, which is what production still
+    /// recorded on 11-27.
+    const TRIGGERS_AS_0438_WROTE_THEM: &str = "
+        DROP TRIGGER publications_identity_immutable;
+        DROP TRIGGER publication_legs_shadow_never_uploads_insert;
+        DROP TRIGGER publication_legs_shadow_never_uploads_update;
+        CREATE TRIGGER publications_identity_immutable
+        BEFORE UPDATE OF id, project_id, kind, trigger, requested_by, force_targets_json, tool, mode, created_at
+        ON publications
+        BEGIN
+            SELECT RAISE(ABORT, 'a publication''s identity is immutable');
+        END;
+        CREATE TRIGGER publication_legs_shadow_never_uploads_insert
+        BEFORE INSERT ON publication_legs
+        WHEN NEW.artifact_location IS NOT NULL
+            AND (SELECT mode FROM publications WHERE id = NEW.publication_id) = 'shadow'
+        BEGIN
+            SELECT RAISE(ABORT, 'a shadow publication never uploads');
+        END;
+        CREATE TRIGGER publication_legs_shadow_never_uploads_update
+        BEFORE UPDATE OF artifact_location ON publication_legs
+        WHEN NEW.artifact_location IS NOT NULL
+            AND (SELECT mode FROM publications WHERE id = NEW.publication_id) = 'shadow'
+        BEGIN
+            SELECT RAISE(ABORT, 'a shadow publication never uploads');
+        END;";
+
+    async fn trigger_sql(db: &LocalDb, name: &'static str) -> Vec<String> {
+        db.query_all(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1 ORDER BY rowid",
+            (name,),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_0455_publication_triggers_replace_the_0438_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join("publication-triggers.db"))
+            .await
+            .unwrap();
+        let at = TURSO_MIGRATIONS
+            .iter()
+            .position(|migration| migration.name() == "publication_triggers_reasserted")
+            .expect("the reassertion is registered");
+        MigrationRunner::new(TURSO_MIGRATIONS[..at].to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute_script(TRIGGERS_AS_0438_WROTE_THEM)
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO publications(id, project_id, kind, trigger, mode, state, created_at)
+             VALUES ('p', 'prj', 'executor', 'merge', 'live', 'running', 1)",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS[at..].to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let fresh = migrated_test_db("publication-triggers-fresh").await;
+        for name in REDEFINED_BY_0455 {
+            let created = trigger_sql(&fresh, name).await;
+            assert_eq!(created.len(), 1, "a fresh chain records {name} once");
+            assert_eq!(
+                trigger_sql(&db, name).await,
+                created,
+                "{name} is recorded once, with the text a fresh chain gives it"
+            );
+        }
+        let refused = db
+            .execute(
+                "UPDATE publications SET live_targets_json = '[\"x\"]' WHERE id = 'p'",
+                (),
+            )
+            .await
+            .expect_err("live_targets_json is part of a publication's identity");
+        assert!(
+            refused.to_string().contains("identity is immutable"),
+            "{refused}"
+        );
+        let refused = db
+            .execute(
+                "INSERT INTO publication_legs(publication_id, target, leg, seq, builder_kind, state, mode, artifact_location)
+                 VALUES ('p', 't', 'publish', 1, 'fleet', 'running', 'shadow', 's3://bucket/key')",
+                (),
+            )
+            .await
+            .expect_err("a shadow leg of a live publication uploads nothing");
+        assert!(
+            refused.to_string().contains("a shadow leg never uploads"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_integrity_sweep_reports_a_trigger_the_chain_would_not_create() {
+        let db = migrated_test_db("stale-trigger-sweep").await;
+        db.execute_script(TRIGGERS_AS_0438_WROTE_THEM)
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE integrity_sweep_state SET last_swept_at = NULL WHERE id = 1",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let IntegritySweepOutcome::SchemaDrift(findings) = run_integrity_sweep(&db).await.unwrap()
+        else {
+            panic!("a stale trigger is schema drift");
+        };
+        assert_eq!(findings.len(), REDEFINED_BY_0455.len(), "{findings:#?}");
+        for name in REDEFINED_BY_0455 {
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.starts_with(&format!("trigger {name} is stale: "))),
+                "{name} is reported: {findings:#?}"
+            );
+        }
+    }
+}

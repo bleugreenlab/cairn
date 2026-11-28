@@ -1054,7 +1054,7 @@ pub async fn verify(source_path: &Path, dest_path: &Path) -> Result<Verification
 /// the other. The copy executes the source's text verbatim, so whitespace is
 /// the only thing the rendering can change. Quoted literals and identifiers
 /// are kept byte for byte, so a changed string or name still differs.
-fn normalized_sql(sql: &str) -> String {
+pub(crate) fn normalized_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut quote: Option<char> = None;
     for ch in sql.chars() {

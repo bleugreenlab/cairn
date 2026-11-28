@@ -1,5 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use super::migrations::TURSO_MIGRATIONS;
+use super::reclaim::normalized_sql;
 use super::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 
 /// Outcome of reading every `PRAGMA integrity_check` row.
@@ -100,6 +102,12 @@ pub enum IntegritySweepOutcome {
     Unrepaired(Vec<String>),
     /// Something other than index-entry drift. Reported, never repaired.
     Corrupt(Vec<String>),
+    /// `integrity_check` was clean, but a trigger, view or index is recorded
+    /// twice in `sqlite_master`, or its text differs from what the migration
+    /// chain creates on an empty database (see [`schema_object_drift`]).
+    /// Reported, never repaired. On a store whose `integrity_check` also fails,
+    /// that outcome is returned and these findings are in the log.
+    SchemaDrift(Vec<String>),
 }
 
 /// Verify the whole database and repair recoverable index-entry drift.
@@ -113,6 +121,16 @@ pub async fn run_integrity_sweep(db: &LocalDb) -> DbResult<IntegritySweepOutcome
     if !integrity_sweep_due(db).await? {
         return Ok(IntegritySweepOutcome::Skipped);
     }
+
+    // Before the maintenance read opens: building the chain's schema takes
+    // seconds, and no checkpoint folds while that read is open.
+    let schema = match schema_object_drift(db, TURSO_MIGRATIONS).await {
+        Ok(findings) => findings,
+        Err(error) => {
+            log::warn!("integrity sweep: could not compare schema objects: {error}");
+            Vec::new()
+        }
+    };
 
     // Declared, so every checkpoint skips its fold rather than draining against
     // a statement that cannot yield, and the gate watch names it.
@@ -151,6 +169,19 @@ pub async fn run_integrity_sweep(db: &LocalDb) -> DbResult<IntegritySweepOutcome
                 msgs.join("; ")
             );
             IntegritySweepOutcome::Corrupt(msgs)
+        }
+    };
+    drop(conn);
+    let outcome = if schema.is_empty() {
+        outcome
+    } else {
+        log::error!(
+            "integrity sweep: schema objects differ from what the migration chain creates: {}",
+            schema.join("; ")
+        );
+        match outcome {
+            IntegritySweepOutcome::Clean => IntegritySweepOutcome::SchemaDrift(schema),
+            other => other,
         }
     };
 
@@ -193,6 +224,222 @@ async fn record_integrity_sweep(db: &LocalDb) -> DbResult<()> {
     )
     .await
     .map(|_| ())
+}
+
+/// One trigger, view or explicit index as `sqlite_master` records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaObject {
+    kind: String,
+    name: String,
+    sql: String,
+}
+
+/// Every trigger, view and explicit index, in creation order. Tables are left
+/// out: a table a later migration rebuilds or alters is stored in that
+/// statement's rendering, which differs from a fresh chain's in quoting as well
+/// as whitespace, and its shape is what `integrity_check` and the migrations'
+/// own checks already cover.
+async fn schema_objects(db: &LocalDb) -> DbResult<Vec<SchemaObject>> {
+    db.query_all(
+        "SELECT type, name, sql FROM sqlite_master \
+         WHERE type IN ('trigger', 'view', 'index') AND sql IS NOT NULL ORDER BY rowid",
+        (),
+        |row| {
+            Ok(SchemaObject {
+                kind: row.text(0)?,
+                name: row.text(1)?,
+                sql: row.text(2)?,
+            })
+        },
+    )
+    .await
+}
+
+/// The triggers, views and indexes `lineage` creates on an empty database,
+/// built in a scratch database that is removed afterwards.
+async fn expected_schema_objects(lineage: &[Migration]) -> DbResult<Vec<SchemaObject>> {
+    let scratch = tempfile::tempdir()?;
+    let db = LocalDb::open(scratch.path().join("expected-schema.db")).await?;
+    MigrationRunner::new(lineage.to_vec()).run(&db).await?;
+    schema_objects(&db).await
+}
+
+/// Duplicated, stale, missing and unknown schema objects in `db`.
+///
+/// A migration that drops and recreates an object can be recorded as applied
+/// while the database keeps the old definition: on 11-27 the production store
+/// held 0438's text for the three triggers 0455 redefines, two rows each, and
+/// nothing reported it (cairn/7751). Two `sqlite_master` rows for one
+/// `(type, name)` are reported on any database. The text comparison needs the
+/// database to be at the head of `lineage`, since an older ledger legitimately
+/// holds older definitions, and builds the expectation by migrating a scratch
+/// database, which takes seconds; the sweep's weekly cadence is what affords it.
+async fn schema_object_drift(db: &LocalDb, lineage: &[Migration]) -> DbResult<Vec<String>> {
+    let store = schema_objects(db).await?;
+    let at_head = match lineage.last() {
+        Some(head) => db
+            .query_opt(
+                "SELECT 1 FROM cairn_schema_migrations WHERE version = ?1 AND name = ?2",
+                (head.version, head.name),
+                |row| row.i64(0),
+            )
+            .await?
+            .is_some(),
+        None => false,
+    };
+    if !at_head {
+        log::info!(
+            "integrity sweep: schema text not compared: the migration ledger is not at the chain's head"
+        );
+        return Ok(schema_object_findings(&store, None));
+    }
+    let expected = expected_schema_objects(lineage).await?;
+    Ok(schema_object_findings(&store, Some(&expected)))
+}
+
+/// What [`schema_object_drift`] reports, given the database's objects and, when
+/// the text is compared, the chain's. Two renderings of one statement that
+/// differ only in whitespace are the same object (see [`normalized_sql`]).
+fn schema_object_findings(
+    store: &[SchemaObject],
+    expected: Option<&[SchemaObject]>,
+) -> Vec<String> {
+    let mut recorded: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+    for object in store {
+        recorded
+            .entry((&object.kind, &object.name))
+            .or_default()
+            .push(&object.sql);
+    }
+    let mut findings: Vec<String> = recorded
+        .iter()
+        .filter(|(_, copies)| copies.len() > 1)
+        .map(|((kind, name), copies)| {
+            format!(
+                "{kind} {name} is recorded {} times in sqlite_master",
+                copies.len()
+            )
+        })
+        .collect();
+    let Some(expected) = expected else {
+        return findings;
+    };
+    let expected: BTreeMap<(&str, &str), &str> = expected
+        .iter()
+        .map(|object| {
+            (
+                (object.kind.as_str(), object.name.as_str()),
+                object.sql.as_str(),
+            )
+        })
+        .collect();
+    for ((kind, name), copies) in &recorded {
+        let Some(want) = expected.get(&(*kind, *name)) else {
+            findings.push(format!(
+                "{kind} {name} is in this database but no migration creates it"
+            ));
+            continue;
+        };
+        let distinct: BTreeSet<&str> = copies.iter().copied().collect();
+        for sql in distinct {
+            if normalized_sql(sql) != normalized_sql(want) {
+                findings.push(format!(
+                    "{kind} {name} is stale: this database has {sql:?} where the migration chain creates {want:?}"
+                ));
+            }
+        }
+    }
+    for (kind, name) in expected.keys() {
+        if !recorded.contains_key(&(*kind, *name)) {
+            findings.push(format!(
+                "{kind} {name} is missing: the migration chain creates it"
+            ));
+        }
+    }
+    findings
+}
+
+/// The triggers, views and indexes `sql` drops, as `(type, name)`.
+///
+/// A word scan, not a parse: a `DROP` mentioned in a comment is read too, which
+/// only adds a name to [`refuse_duplicated_drops`]' check.
+fn dropped_schema_objects(sql: &str) -> Vec<(&'static str, String)> {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let mut dropped = Vec::new();
+    for (at, word) in words.iter().enumerate() {
+        if !word.eq_ignore_ascii_case("drop") {
+            continue;
+        }
+        let Some(kind) = words.get(at + 1).and_then(|next| {
+            ["trigger", "view", "index"]
+                .into_iter()
+                .find(|kind| next.eq_ignore_ascii_case(kind))
+        }) else {
+            continue;
+        };
+        let mut name_at = at + 2;
+        if words
+            .get(name_at)
+            .is_some_and(|w| w.eq_ignore_ascii_case("if"))
+            && words
+                .get(name_at + 1)
+                .is_some_and(|w| w.eq_ignore_ascii_case("exists"))
+        {
+            name_at += 2;
+        }
+        let Some(raw) = words.get(name_at) else {
+            continue;
+        };
+        let qualified = raw.trim_end_matches(';');
+        let name = qualified
+            .rsplit('.')
+            .next()
+            .unwrap_or(qualified)
+            .trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'));
+        if !name.is_empty() {
+            dropped.push((kind, name.to_string()));
+        }
+    }
+    dropped
+}
+
+/// Fail a migration that leaves an object it drops recorded more than once.
+///
+/// `DROP TRIGGER`, `DROP VIEW` and `DROP INDEX` delete the first matching
+/// `sqlite_schema` row and the engine's in-memory object. On a database that
+/// already records the object twice the drop leaves one old row behind, the
+/// migration's `CREATE` adds its own beside it, and the migration would commit
+/// with the old definition still on disk. No SQL can remove that row
+/// (`sqlite_schema` refuses direct writes), so the migration is refused rather
+/// than recorded as applied. Runs inside the migration's transaction, so a
+/// refusal rolls it back.
+async fn refuse_duplicated_drops(conn: &TrackedConnection, sql: &str) -> DbResult<()> {
+    let mut duplicated = Vec::new();
+    for (kind, name) in dropped_schema_objects(sql) {
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+                (kind, name.as_str()),
+            )
+            .await?;
+        let copies = match rows.next().await? {
+            Some(row) => row.i64(0)?,
+            None => 0,
+        };
+        drop(rows);
+        if copies > 1 {
+            duplicated.push(format!("{kind} {name} ({copies} rows)"));
+        }
+    }
+    if duplicated.is_empty() {
+        return Ok(());
+    }
+    Err(DbError::Migration(format!(
+        "it drops and recreates {}, which this database already recorded more than once in \
+         sqlite_schema; a drop removes one row, so the old definition would survive the \
+         migration. See docs/database.md, \"Adding a Migration\"",
+        duplicated.join(", ")
+    )))
 }
 
 /// Best-effort, one-shot index-drift repair for a freshly imported database.
@@ -620,6 +867,7 @@ impl MigrationRunner {
             let name = name.clone();
             Box::pin(async move {
                 conn.execute_batch(sql).await?;
+                refuse_duplicated_drops(conn, sql).await?;
                 conn.execute(
                     "INSERT INTO cairn_schema_migrations(version, name, applied_at)
                      VALUES (?1, ?2, unixepoch())",
@@ -697,6 +945,7 @@ impl MigrationRunner {
             }
 
             conn.execute_batch(migration.sql).await?;
+            refuse_duplicated_drops(&conn, migration.sql).await?;
 
             for (check, before) in migration.verify.iter().zip(before) {
                 let table = check.table();
@@ -856,6 +1105,67 @@ mod tests {
         .await
         .unwrap();
         assert!(integrity_sweep_due(&db).await.unwrap());
+    }
+
+    fn object(kind: &str, name: &str, sql: &str) -> SchemaObject {
+        SchemaObject {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            sql: sql.to_string(),
+        }
+    }
+
+    /// A second row for one object is reported whatever the ledger says; the
+    /// text is compared, modulo whitespace, only against a chain's schema.
+    #[test]
+    fn schema_findings_name_duplicated_stale_unknown_and_missing_objects() {
+        let old = "CREATE TRIGGER t BEFORE UPDATE OF a ON x BEGIN SELECT 1; END";
+        let store = [
+            object("trigger", "t", old),
+            object("trigger", "t", old),
+            object("index", "i", "CREATE INDEX i ON x (a)"),
+            object("view", "v", "CREATE VIEW v AS SELECT 1"),
+        ];
+        let chain = [
+            object(
+                "trigger",
+                "t",
+                "CREATE TRIGGER t BEFORE UPDATE OF a, b ON x BEGIN SELECT 1; END",
+            ),
+            object("index", "i", "CREATE INDEX i ON x(a)"),
+            object("index", "j", "CREATE INDEX j ON x(b)"),
+        ];
+
+        assert_eq!(
+            schema_object_findings(&store, None),
+            ["trigger t is recorded 2 times in sqlite_master"]
+        );
+        assert_eq!(
+            schema_object_findings(&store, Some(&chain)),
+            [
+                "trigger t is recorded 2 times in sqlite_master".to_string(),
+                format!(
+                    "trigger t is stale: this database has {old:?} where the migration chain \
+                     creates \"CREATE TRIGGER t BEFORE UPDATE OF a, b ON x BEGIN SELECT 1; END\""
+                ),
+                "view v is in this database but no migration creates it".to_string(),
+                "index j is missing: the migration chain creates it".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_schema_objects_reads_each_dropped_trigger_view_and_index() {
+        let sql = "-- lineage: private\nDROP TRIGGER a;\ndrop index if exists \"b\";\n\
+                   DROP VIEW main.c;\nDROP TABLE d;\nCREATE TRIGGER a BEFORE INSERT ON d BEGIN SELECT 1; END;";
+        assert_eq!(
+            dropped_schema_objects(sql),
+            [
+                ("trigger", "a".to_string()),
+                ("index", "b".to_string()),
+                ("view", "c".to_string()),
+            ]
+        );
     }
 
     #[test]
