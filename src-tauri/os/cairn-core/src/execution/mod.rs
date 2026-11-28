@@ -18,6 +18,7 @@ pub mod approvals;
 pub mod artifact_revisions;
 pub mod branch_target;
 pub mod cache;
+pub(crate) mod cached_result_slimming;
 pub mod canonical;
 pub mod check_evidence;
 pub mod check_identity;

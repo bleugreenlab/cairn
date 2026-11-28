@@ -2963,6 +2963,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
+        "cached_result_slimming_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
         "effect_outbox",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),

@@ -1441,7 +1441,12 @@ pub(crate) fn claim_check_execution(
 /// A pass may refresh another pass, including cache-hit tree/job re-stamping while
 /// preserving the original executor provenance. This is a latest-row store, not
 /// complete attempt history.
-pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Result<(), String> {
+pub fn store_check_result(
+    db: Arc<LocalDb>,
+    mut result: CheckResultCacheWrite,
+) -> Result<(), String> {
+    result.target_results_json =
+        crate::execution::check_parsers::stored_result_json(result.target_results_json);
     let streak_op = result.infra_streak_op().as_param();
     // Family is a property of the PAYLOAD, never of how the counter moves. A
     // re-stamp moves nothing (`Hold`) and is still an infrastructure row, so
@@ -2735,10 +2740,16 @@ pub(crate) fn record_fresh_check_observation(
     }
     let compact = compact_verdict_result(observation.target_results_json.as_deref());
     let observation = observation.claiming_only_what_its_rows_carry(compact.as_deref());
+    // The hot row keeps the result without its plain passes; the lane-answer
+    // classification below reads only counts, so it may read either form.
+    let stored_result = crate::execution::check_parsers::stored_result_json(
+        observation.target_results_json.clone(),
+    );
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
             let observation = observation.clone();
             let compact = compact.clone();
+            let stored_result = stored_result.clone();
             Box::pin(async move {
                 // Keep immutable equality and insertion under Turso's positional
                 // bind limit by carrying the trailing provenance as one value.
@@ -3074,7 +3085,7 @@ pub(crate) fn record_fresh_check_observation(
                     );
                     conn.execute(
                         &target_sql,
-                        params![observation.target_results_json.as_deref(), observation.project_id.as_str(),
+                        params![stored_result.as_deref(), observation.project_id.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
                             observation.environment_fingerprint.as_str(), observation.result_schema_version,
                             observation.id.as_str()],
@@ -4182,6 +4193,207 @@ pub(crate) mod tests {
             observation.input_hash.clone(),
         );
         observation
+    }
+
+    /// A complete nextest result of `passing` plain passes plus one failure,
+    /// one pass that needed a retry and was marked flaky, and one declared
+    /// skip, as the runner hands it over: every test listed.
+    pub(crate) fn many_passes_result(
+        passing: usize,
+    ) -> crate::execution::check_parsers::ParsedCheckResult {
+        use crate::execution::check_parsers::{CheckFailure, CheckTestResult, ParsedCheckResult};
+        let test = |id: &str, status: &str| CheckTestResult {
+            id: id.to_string(),
+            status: status.to_string(),
+            duration_ms: Some(12),
+            attempts: 1,
+            retried: false,
+            flaky: false,
+            failure_message: None,
+            skip_reason: None,
+            skip_declaration: None,
+            skip_declaration_source: None,
+            started_offset_ms: Some(431_208),
+        };
+        let mut tests: Vec<CheckTestResult> = (0..passing)
+            .map(|n| {
+                test(
+                    &format!("cairn-core execution::checks::tests::passes_{n}"),
+                    "passed",
+                )
+            })
+            .collect();
+        tests.push(CheckTestResult {
+            failure_message: Some("assertion failed".to_string()),
+            ..test("cairn-core execution::cache::tests::breaks", "failed")
+        });
+        tests.push(CheckTestResult {
+            attempts: 2,
+            retried: true,
+            flaky: true,
+            ..test("cairn-core decide::flaky", "passed")
+        });
+        tests.push(CheckTestResult {
+            skip_reason: Some("nested-sandbox-exec".to_string()),
+            skip_declaration: Some("manifest".to_string()),
+            ..test("cairn-core sandbox::nested", "skipped")
+        });
+        ParsedCheckResult {
+            schema_version: 1,
+            complete: true,
+            selection: "full".to_string(),
+            tests,
+            undeclared_skips: 0,
+            parser: "nextest".to_string(),
+            passed: passing + 1,
+            failed: 1,
+            suite_failures: 0,
+            skipped: 1,
+            deferred: 0,
+            failures: vec![CheckFailure {
+                name: "cairn-core execution::cache::tests::breaks".to_string(),
+                message: Some("assertion failed".to_string()),
+            }],
+            report: None,
+            phases: None,
+            unverified: None,
+            lint_findings: None,
+            plan_audit: None,
+            accounting: None,
+            ingestion: None,
+        }
+    }
+
+    /// `observation` carrying `parsed` as its structured result and per-test
+    /// rows: a complete genuine red, reusable.
+    fn red_observation(
+        id: &str,
+        environment: &str,
+        parsed: &crate::execution::check_parsers::ParsedCheckResult,
+    ) -> FreshCheckObservationWrite {
+        let mut write = observation(id, &format!("commit-{id}"), environment);
+        write.exit_code = 1;
+        write.verdict = "failed".to_string();
+        write.selection = Some(parsed.selection.clone());
+        write.target_results_json = Some(serde_json::to_string(parsed).unwrap());
+        write.tests = parsed.tests.iter().map(CheckTestResultRow::from).collect();
+        write
+    }
+
+    /// Both writers of the hot row store the counts and every entry that is
+    /// not a plain pass, and no passing entry: 2,000 passes listed one by one
+    /// are about 300 KB of result, and what the row keeps fits in 2 KiB.
+    #[tokio::test]
+    async fn a_stored_verdict_keeps_counts_and_non_passes_but_no_plain_pass() {
+        use crate::execution::check_parsers::ParsedCheckResult;
+        let db = cache_db().await;
+        let parsed = many_passes_result(2_000);
+        let full = serde_json::to_string(&parsed).unwrap();
+        assert!(full.len() > 250_000, "{} bytes", full.len());
+        record_fresh_check_observation(db.clone(), red_observation("obs-slim", "env-a", &parsed))
+            .unwrap();
+        let mut legacy = test_result("project-a", "input-legacy", "rust");
+        legacy.target_results_json = Some(full);
+        store_check_result(db.clone(), legacy).unwrap();
+
+        for input in ["input-rust", "input-legacy"] {
+            let stored = db
+                .query_one(
+                    "SELECT target_results_json FROM check_result_cache WHERE input_hash = ?1",
+                    (input.to_string(),),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap();
+            assert!(stored.len() < 2_048, "{input}: {} bytes", stored.len());
+            assert!(
+                !stored.contains("passes_"),
+                "{input}: a plain pass was kept"
+            );
+            let kept: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
+            assert_eq!((kept.passed, kept.failed, kept.skipped), (2_001, 1, 1));
+            assert_eq!(kept.failures, parsed.failures);
+            let ids: Vec<&str> = kept.tests.iter().map(|test| test.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                [
+                    "cairn-core execution::cache::tests::breaks",
+                    "cairn-core decide::flaky",
+                    "cairn-core sandbox::nested"
+                ],
+                "{input}"
+            );
+            assert_eq!(
+                kept.verdict_facts(),
+                parsed.verdict_facts(),
+                "{input}: every verdict surface reads the same facts"
+            );
+        }
+    }
+
+    /// A verdict an earlier build stored with every passing test listed and
+    /// one stored slim are both served, before the existing-row rewrite and
+    /// after it: the slim shape keeps `schemaVersion` 1 and the row its
+    /// `result_schema_version`, so no cached verdict goes unserved.
+    #[tokio::test]
+    async fn verdicts_stored_before_and_after_the_slim_shape_are_both_served() {
+        use crate::execution::cached_result_slimming::{slim_cached_results, SlimmingBudget};
+        use crate::execution::check_parsers::ParsedCheckResult;
+        let db = cache_db().await;
+        let parsed = many_passes_result(300);
+        let full = serde_json::to_string(&parsed).unwrap();
+        for (id, environment) in [("obs-before", "env-before"), ("obs-after", "env-after")] {
+            record_fresh_check_observation(db.clone(), red_observation(id, environment, &parsed))
+                .unwrap();
+        }
+        db.execute(
+            "UPDATE check_result_cache SET target_results_json = ?1
+              WHERE source_observation_id = 'obs-before'",
+            params![full.as_str()],
+        )
+        .await
+        .unwrap();
+
+        let parsed = &parsed;
+        let served = |environment: &'static str| {
+            let db = db.clone();
+            async move {
+                let hit = get_exact_reusable_check_result(
+                    db,
+                    "project-a",
+                    "rust",
+                    "input-rust",
+                    environment,
+                    1,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("{environment}: the verdict is served"));
+                let json = hit.target_results_json.unwrap();
+                let result: ParsedCheckResult = serde_json::from_str(&json).unwrap();
+                assert_eq!(
+                    result.verdict_facts(),
+                    parsed.verdict_facts(),
+                    "{environment}"
+                );
+                assert_eq!(result.failures, parsed.failures, "{environment}");
+                json.len()
+            }
+        };
+        assert_eq!(served("env-before").await, full.len());
+        assert!(served("env-after").await < 2_048);
+
+        let walk = slim_cached_results(
+            &db,
+            SlimmingBudget {
+                pause: std::time::Duration::ZERO,
+                ..SlimmingBudget::PRODUCTION
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((walk.rewritten, walk.completed), (1, true));
+        assert!(served("env-before").await < 2_048);
+        assert!(served("env-after").await < 2_048);
     }
 
     #[tokio::test]

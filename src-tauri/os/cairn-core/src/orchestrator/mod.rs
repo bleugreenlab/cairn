@@ -3796,6 +3796,37 @@ impl Orchestrator {
         cairn_common::task::spawn(async move { orch.run_delegated_packet_backfill().await });
     }
 
+    /// Drop plain passes from `check_result_cache` results earlier builds
+    /// stored (cairn/7748), resuming wherever the last start stopped. Gated by
+    /// `cached_result_slimming_state`, so once the walk has finished every
+    /// later start pays one read. Nothing waits on it: an unrewritten row reads
+    /// as before.
+    pub async fn run_cached_result_slimming(&self) {
+        use crate::execution::cached_result_slimming::{slim_cached_results, SlimmingBudget};
+        match slim_cached_results(&self.db.local, SlimmingBudget::PRODUCTION).await {
+            Ok(report) if report.rows_read > 0 => log::info!(
+                "cached result slimming: read {} rows, rewrote {} ({} -> {} bytes), {} changed \
+                 under the walk, {} fold(s){}",
+                report.rows_read,
+                report.rewritten,
+                report.bytes_before,
+                report.bytes_after,
+                report.contended,
+                report.folds,
+                if report.completed { "; complete" } else { "" },
+            ),
+            Ok(_) => {}
+            Err(e) => log::warn!("cached result slimming failed: {e}"),
+        }
+    }
+
+    /// [`Self::run_cached_result_slimming`] on its own task: its first walk
+    /// reads the whole column, gigabytes on a long-lived store.
+    pub fn spawn_cached_result_slimming(&self) {
+        let orch = self.clone();
+        cairn_common::task::spawn(async move { orch.run_cached_result_slimming().await });
+    }
+
     /// Spawn the live recipe scheduler: a detached loop that fires
     /// schedule-triggered recipes. Each fire creates a fresh issue and starts the
     /// recipe as that issue's execution, stamped `triggered_by = schedule`, so a

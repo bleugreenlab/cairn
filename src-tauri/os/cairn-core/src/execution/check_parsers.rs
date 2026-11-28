@@ -42,7 +42,11 @@
 //! `target_results_json` column. It is deliberately the SUBSTRATE future
 //! baseline/delta work consumes: `failures[].name` is a stable per-test
 //! identifier that can be compared across two sealed trees to attribute a break
-//! to a diff. The full shape is documented in `docs/checks.md`.
+//! to a diff. The column keeps the counts and every `tests[]` entry except the
+//! plain passes ([`CheckTestResult::is_plain_pass`], dropped by
+//! [`without_plain_passes`]): one record per passing test was nearly all of
+//! its bytes, and no reader of the column needs a passing test's name. The full
+//! shape is documented in `docs/checks.md`.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -129,7 +133,9 @@ pub struct ParsedCheckResult {
     /// `full`, `filtered`, `empty`, or `unknown`.
     #[serde(default = "unknown_selection")]
     pub(crate) selection: String,
-    /// Final result for every selected test when `complete` is true.
+    /// Final result for every selected test when `complete` is true. A result
+    /// read back from `check_result_cache` holds only the entries that are not
+    /// plain passes ([`without_plain_passes`]); the counts below cover the rest.
     #[serde(default)]
     pub(crate) tests: Vec<CheckTestResult>,
     /// Self-skips lacking manifest or environment authority.
@@ -528,6 +534,48 @@ pub(crate) struct CheckTestResult {
 
 fn one_attempt() -> u32 {
     1
+}
+
+impl CheckTestResult {
+    /// A test that passed on its first attempt and carries nothing beyond its
+    /// identity and timing: no retry, no flake mark, no message, no skip
+    /// provenance. Its whole contribution is one to `passed`, so a store keeps
+    /// it as that count rather than as an entry. Anything else (a failure, a
+    /// skip, a pass that needed a retry or was marked flaky) is kept whole.
+    pub(crate) fn is_plain_pass(&self) -> bool {
+        self.status == "passed"
+            && self.attempts <= 1
+            && !self.retried
+            && !self.flaky
+            && self.failure_message.is_none()
+            && self.skip_reason.is_none()
+            && self.skip_declaration.is_none()
+            && self.skip_declaration_source.is_none()
+    }
+}
+
+/// A serialized [`ParsedCheckResult`] without its plain passes
+/// ([`CheckTestResult::is_plain_pass`]), the shape `check_result_cache` keeps.
+/// `None` when there is nothing to drop: not JSON, no `tests` array, or no plain
+/// pass in it, so the caller keeps the bytes it has.
+///
+/// Only `tests` changes. Every other field, a newer build's included, is
+/// carried as read, and an entry this build cannot read is kept. The shape
+/// stays `schemaVersion` 1: it deserializes into the same struct and every
+/// reader answers from the counts and the kept entries.
+pub(crate) fn without_plain_passes(json: &str) -> Option<String> {
+    use serde::Deserialize;
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let tests = value.get_mut("tests")?.as_array_mut()?;
+    let read = tests.len();
+    tests.retain(|test| !CheckTestResult::deserialize(test).is_ok_and(|test| test.is_plain_pass()));
+    (tests.len() < read).then(|| value.to_string())
+}
+
+/// `json` as `check_result_cache.target_results_json` stores it
+/// ([`without_plain_passes`]), or as given when there is nothing to drop.
+pub(crate) fn stored_result_json(json: Option<String>) -> Option<String> {
+    json.map(|json| without_plain_passes(&json).unwrap_or(json))
 }
 
 impl ParsedCheckResult {
