@@ -29,7 +29,7 @@ async fn transcript(db: &LocalDb, sql: &str, run: &str, turn: &str) -> Vec<Trans
 /// the last two, which a settlement answered: one for a process loss and one
 /// for a user stop.
 async fn seed_long_turn(db: &LocalDb, run: &str, turn: &str, calls: usize) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO runs (id, status, created_at, updated_at) VALUES ('{run}', 'exited', 1, 1);
          INSERT INTO turns (id, session_id, run_id, sequence, state, start_reason, created_at, updated_at)
           VALUES ('{turn}', 'sess-{turn}', '{run}', 1, 'interrupted', 'initial', 1, 1);
