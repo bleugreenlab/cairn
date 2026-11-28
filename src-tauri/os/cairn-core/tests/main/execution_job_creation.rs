@@ -160,6 +160,7 @@ fn delegated_packet(parent_job_id: &str, agent_node_id: &str) -> DelegatedWorkPa
         task_index: Some(0),
         models: None,
         background: false,
+        owed_by_notice: false,
         created_at: 1,
     }
 }

@@ -1525,6 +1525,36 @@ async fn inline_wait_releases_a_task_that_returns_and_exits_cleanly() {
     );
     assert_eq!(response, RETURNED);
     assert_eq!(reprompts(&orch, &child).await, 0);
+
+    // The parent's turn completes with the answer in hand, and the child's
+    // warm run later exits: that finalization re-enters the completion
+    // handler, which owes the parent nothing (cairn/7764).
+    orch.db
+        .local
+        .execute(
+            "UPDATE turns SET state='complete', ended_at=2, updated_at=2 WHERE id='T1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let refinalized = child.clone();
+    on_blocking_thread(&orch, move |orch| {
+        crate::execution::delegation::resume_suspended_parent_after_task_completion(
+            orch,
+            &refinalized,
+        )
+        .unwrap();
+    })
+    .await;
+    assert_eq!(
+        count(
+            &orch,
+            "SELECT COUNT(*) FROM attention_pushes WHERE recipient='j-parent' AND key LIKE 'tasks:%'",
+        )
+        .await,
+        0,
+        "a batch answered inline is never delivered again"
+    );
 }
 
 /// The child job a spawn under way created, once it exists.

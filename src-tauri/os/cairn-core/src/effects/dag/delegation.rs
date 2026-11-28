@@ -51,6 +51,7 @@ mod tests {
             task_index: Some(7),
             models: None,
             background: false,
+            owed_by_notice: false,
             created_at: 1,
         }
     }

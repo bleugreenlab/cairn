@@ -663,7 +663,9 @@ async fn child_thread_session_stays_liveness_only() {
 }
 
 /// (a) The parent moved on long ago: the stranded task settles Complete, and
-/// nothing at all reaches the parent.
+/// nothing at all reaches the parent. Its head, which a defective park had
+/// pointed back at the anchor that `later` succeeds (cairn/7764), is first
+/// re-pointed at the chain's tail, and a second boot leaves it there.
 #[tokio::test]
 async fn repair_settles_a_stranded_task_without_touching_a_parent_that_moved_on() {
     let db = test_db().await;
@@ -673,11 +675,21 @@ async fn repair_settles_a_stranded_task_without_touching_a_parent_that_moved_on(
         &[Task::delivered("j-measure", "pkt-measure", 1_757_000_000)],
     )
     .await;
+    db.execute(
+        "UPDATE jobs SET current_turn_id = 'anchor' WHERE id = ?1",
+        params![SESSION],
+    )
+    .await
+    .unwrap();
     let orch = test_orchestrator(db);
     let messages_before = count(&orch, "SELECT COUNT(*) FROM messages").await;
+    let head = "SELECT current_turn_id FROM jobs WHERE id = ?1";
 
     reconcile(&orch);
 
+    assert_eq!(text(&orch, head, SESSION).await.as_deref(), Some("later"));
+    reconcile(&orch);
+    assert_eq!(text(&orch, head, SESSION).await.as_deref(), Some("later"));
     assert_eq!(status(&orch, "j-measure").await, "complete");
     assert_eq!(
         count(

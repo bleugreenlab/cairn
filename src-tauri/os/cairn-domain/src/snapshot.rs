@@ -85,6 +85,14 @@ pub struct DelegatedWorkPacket {
     /// snapshots deserializable as non-background.
     #[serde(default)]
     pub background: bool,
+    /// The spawning call returned without this batch's result: its wait
+    /// parked, or the turn that made the call had already ended. The settled
+    /// result is then owed to the parent by the completion path, through the
+    /// claimed resume of a parked turn or, failing that, a `tasks:` notice.
+    /// Never set for a batch the call answered inline, so a child whose run is
+    /// finalized again never re-delivers what the parent already has.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owed_by_notice: bool,
     pub created_at: i64,
 }
 
@@ -531,6 +539,7 @@ mod tests {
                 task_index: Some(0),
                 models: None,
                 background: false,
+                owed_by_notice: false,
                 created_at: 1234567890,
             }],
             created_at: 1234567890,

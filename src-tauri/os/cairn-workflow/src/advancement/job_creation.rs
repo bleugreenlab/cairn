@@ -591,6 +591,7 @@ mod tests {
                     task_index: Some(0),
                     models: None,
                     background: false,
+                    owed_by_notice: false,
                     created_at: 1,
                 };
                 crate::delegated_packets::insert(conn, "e", &packet).await?;

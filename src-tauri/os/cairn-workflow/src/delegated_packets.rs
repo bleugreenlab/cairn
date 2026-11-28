@@ -425,6 +425,9 @@ pub struct PacketChange {
     pub materialized_node_ids: Option<Vec<String>>,
     /// Set only where it is unset: a packet's child is named once.
     pub result_artifact_job_id: Option<String>,
+    /// Record that the spawning call returned without the packet's result
+    /// (`DelegatedWorkPacket::owed_by_notice`). It is never cleared.
+    pub owed_by_notice: bool,
 }
 
 /// Copy a packet that is only inline into the table, at its array index.
@@ -485,6 +488,14 @@ pub async fn update(
             "UPDATE delegated_packets SET result_artifact_job_id = ?3 \
              WHERE execution_id = ?1 AND id = ?2 AND result_artifact_job_id IS NULL",
             (execution_id, packet_id, job_id.as_str()),
+        )
+        .await?;
+    }
+    if change.owed_by_notice {
+        conn.execute(
+            "UPDATE delegated_packets SET spec = json_set(spec, '$.owedByNotice', json('true')) \
+             WHERE execution_id = ?1 AND id = ?2",
+            (execution_id, packet_id),
         )
         .await?;
     }

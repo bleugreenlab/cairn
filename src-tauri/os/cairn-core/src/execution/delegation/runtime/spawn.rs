@@ -25,7 +25,9 @@ use super::common::{
 };
 use super::results::{build_task_callback_response, task_artifact_uri, task_has_settled};
 use super::resume::{
-    prepare_parent_for_delegated_wait, schedule_deferred_parent_suspend_for_delegated_wait,
+    deliver_owed_batch_if_settled, mark_owed_by_notice, prepare_parent_for_delegated_wait,
+    schedule_deferred_parent_suspend_for_delegated_wait, spawning_turn_receives_answer,
+    DelegatedWaitPark,
 };
 
 use cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET;
@@ -1066,20 +1068,30 @@ fn suspend_parent_for_owned_loop(
     materialized: &[MaterializedTask],
 ) -> CallbackResponse {
     let first = &materialized[0];
-    if let Err(error) = prepare_parent_for_delegated_wait(orch, parent_ctx, &first.packet) {
-        log::warn!(
-            "Failed to prepare owned-loop delegated wait for parent job {}: {}",
-            parent_ctx.job_id,
-            error
-        );
-    }
-    orch.process_state
-        .request_suspend(&parent_ctx.run_id, SuspendKind::DelegatedTask);
     let summary = if materialized.len() == 1 {
         format!("Delegated task '{}'", materialized[0].description)
     } else {
         format!("{} delegated tasks", materialized.len())
     };
+    let parked = prepare_parent_for_delegated_wait(orch, parent_ctx, &first.packet);
+    owe_batch_by_notice(orch, materialized);
+    match parked {
+        Ok(DelegatedWaitPark::Superseded) => {
+            deliver_owed_batch_if_settled(orch.clone(), first.job_id.clone());
+            return superseded_wait_response(parent_ctx, &summary);
+        }
+        Ok(DelegatedWaitPark::Parked) => {}
+        Err(error) => {
+            log::warn!(
+                "Failed to prepare owned-loop delegated wait for parent job {}: {}",
+                parent_ctx.job_id,
+                error
+            );
+            deliver_owed_batch_if_settled(orch.clone(), first.job_id.clone());
+        }
+    }
+    orch.process_state
+        .request_suspend(&parent_ctx.run_id, SuspendKind::DelegatedTask);
     CallbackResponse {
         result: format!("{summary} {DELEGATED_TASKS_SUSPENDED_SUFFIX}"),
         ..Default::default()
@@ -1176,9 +1188,43 @@ async fn wait_for_tasks_completion(
         }
     };
     match tokio::time::timeout(budget, all_settled).await {
-        Ok(true) => build_tasks_response(orch, parent_ctx, &materialized).await,
+        Ok(true) => {
+            // The children settled inside the budget, but an answer only
+            // reaches the agent while the turn that made the call is still
+            // running. A turn the provider already ended would lose it.
+            if let Some(anchor) = materialized[0].packet.parent_turn_id.as_deref() {
+                let parent_db =
+                    crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id)
+                        .await
+                        .unwrap_or_else(|_| orch.db.local.clone());
+                if !spawning_turn_receives_answer(&parent_db, &parent_ctx.job_id, anchor).await {
+                    owe_batch_by_notice(orch, &materialized);
+                    deliver_owed_batch_if_settled(orch.clone(), materialized[0].job_id.clone());
+                    let summary = if materialized.len() == 1 {
+                        format!("Delegated task '{}'", materialized[0].description)
+                    } else {
+                        format!("{} delegated tasks", materialized.len())
+                    };
+                    return superseded_wait_response(parent_ctx, &summary);
+                }
+            }
+            build_tasks_response(orch, parent_ctx, &materialized).await
+        }
         _ => suspend_parent_for_tasks(orch, parent_ctx, &materialized).await,
     }
+}
+
+/// Record that the call is returning without the batch's result, so the
+/// completion path owes it to the parent. A batch answered inline is never
+/// marked, and is therefore never delivered a second time.
+fn owe_batch_by_notice(orch: &Orchestrator, materialized: &[MaterializedTask]) {
+    mark_owed_by_notice(
+        orch,
+        materialized
+            .iter()
+            .map(|task| (task.job_id.clone(), task.packet.id.clone()))
+            .collect(),
+    );
 }
 
 /// Yield the parent turn once and schedule the durable suspend for a task batch.
@@ -1194,20 +1240,31 @@ async fn suspend_parent_for_tasks(
         orch.process_state
             .capture_turn_owner(&parent_ctx.run_id, turn_id)
     });
-    if let Err(error) = prepare_parent_for_delegated_wait(orch, parent_ctx, &first.packet) {
-        log::warn!(
-            "Failed to prepare durable wait for parent job {}: {}",
-            parent_ctx.job_id,
-            error
-        );
-    } else {
-        schedule_deferred_parent_suspend_for_delegated_wait(
+    let parked = prepare_parent_for_delegated_wait(orch, parent_ctx, &first.packet);
+    // However the wait ends up, this call does not carry the batch's result.
+    owe_batch_by_notice(orch, materialized);
+    match &parked {
+        // Only a parked spawning turn is interrupted: a superseded one has
+        // nothing to park, and the turn now running is not this wait's. The
+        // park's own re-check delivers a child that settled meanwhile.
+        Ok(DelegatedWaitPark::Parked) => schedule_deferred_parent_suspend_for_delegated_wait(
             orch.clone(),
             parent_ctx.run_id.clone(),
             parent_ctx.job_id.clone(),
             first.job_id.clone(),
             turn_owner,
-        );
+        ),
+        Ok(DelegatedWaitPark::Superseded) => {
+            deliver_owed_batch_if_settled(orch.clone(), first.job_id.clone());
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to prepare durable wait for parent job {}: {}",
+                parent_ctx.job_id,
+                error
+            );
+            deliver_owed_batch_if_settled(orch.clone(), first.job_id.clone());
+        }
     }
     // Name the address each task was actually minted at. A task's slug is
     // derived from its description rather than being the description
@@ -1234,8 +1291,29 @@ async fn suspend_parent_for_tasks(
     } else {
         format!("{} delegated tasks{at}", materialized.len())
     };
+    if matches!(parked, Ok(DelegatedWaitPark::Superseded)) {
+        return superseded_wait_response(parent_ctx, &summary);
+    }
     CallbackResponse {
         result: format!("{summary} {DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX}"),
+        ..Default::default()
+    }
+}
+
+/// The answer to a task call whose turn had already ended when the call
+/// finished waiting. Nothing parks, and the batch is owed by notice: its
+/// settled result reaches the parent as a `tasks:` push in whatever turn it is
+/// in.
+fn superseded_wait_response(parent_ctx: &ParentRunContext, summary: &str) -> CallbackResponse {
+    log::info!(
+        "Delegated wait of parent job {} outlived its spawning turn; its result will arrive as a notice",
+        parent_ctx.job_id
+    );
+    CallbackResponse {
+        result: format!(
+            "{summary}: the turn that spawned it has ended, so its result will arrive as a \
+             notice once it settles."
+        ),
         ..Default::default()
     }
 }
@@ -1811,10 +1889,19 @@ pub(super) mod unstarted_child_tests {
         (orch, task.job_id.clone(), requests)
     }
 
-    /// A child that fails before it ever had a run wakes the parent parked on
-    /// it, with the failure.
+    /// A child that fails before it ever had a run reaches the parent that
+    /// spawned it, with the failure: through the resume of the turn parked on
+    /// it, or, when the provider ended the spawning turn and a later turn
+    /// became the head while the call was still waiting, as a `tasks:` notice
+    /// that wakes the parent onto its real head. The notice comes whether the
+    /// inline budget then ran out or the child settled inside it (cairn/7764).
     #[tokio::test(flavor = "multi_thread")]
-    async fn start_failure_of_a_never_started_child_wakes_its_parked_parent() {
+    async fn start_failure_of_a_never_started_child_reaches_its_parent() {
+        for settles_inside_budget in [false, true] {
+            outlived_spawning_turn_delivers_by_notice(settles_inside_budget).await;
+        }
+
+        // The parent parked on its task.
         let (orch, child, _requests) = spawn_and_park("unstarted-child-start-failure.db").await;
         assert_eq!(
             count(
@@ -1841,6 +1928,136 @@ pub(super) mod unstarted_child_tests {
             .await
             .expect("the wake delivers the failure to the spawning call");
         assert!(delivered.contains("failed"), "{delivered}");
+    }
+
+    /// The provider ends the later turn too, and the parent's child fails
+    /// before it ever started.
+    async fn end_later_turn_and_fail_child(
+        orch: &Orchestrator,
+        provider_turn: &Arc<Mutex<Option<String>>>,
+    ) {
+        orch.db
+            .local
+            .execute(
+                "UPDATE turns SET state='complete', ended_at=3, updated_at=3 WHERE id='T2'",
+                (),
+            )
+            .await
+            .unwrap();
+        orch.process_state.set_current_turn_id("run-parent", None);
+        *provider_turn.lock().unwrap() = None;
+        let child = text(orch, "SELECT id FROM jobs WHERE parent_job_id = 'j-parent'")
+            .await
+            .expect("the child exists");
+        crate::execution::jobs::mark_job_start_failed(
+            orch,
+            &orch.db.local,
+            &child,
+            "branch preparation failed: store unavailable",
+            true,
+        )
+        .await;
+    }
+
+    /// One task spawned by a turn the provider ends while the call is still
+    /// waiting: T2 becomes the head, and the child fails either after the
+    /// budget ran out or inside it.
+    async fn outlived_spawning_turn_delivers_by_notice(settles_inside_budget: bool) {
+        let db_name = format!("unstarted-child-superseded-{settles_inside_budget}.db");
+        let (orch, _executor) = parent_fixture(&db_name).await;
+        let (requests, provider_turn) = register_parent_process(&orch);
+        let supersede = {
+            let orch = orch.clone();
+            let provider_turn = provider_turn.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while count(
+                    &orch,
+                    "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'j-parent'",
+                )
+                .await
+                    == 0
+                {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "no child was created"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                orch.db
+                    .local
+                    .execute_script(
+                        "UPDATE turns SET state='complete', ended_at=2, updated_at=2 WHERE id='T1';
+                         INSERT INTO turns(id,session_id,run_id,job_id,sequence,predecessor_id,state,start_reason,created_at,started_at,updated_at)
+                           VALUES('T2','session-parent','run-parent','j-parent',2,'T1','running','follow_up',2,2,2);
+                         UPDATE jobs SET current_turn_id='T2' WHERE id='j-parent';",
+                    )
+                    .await
+                    .unwrap();
+                orch.process_state
+                    .set_current_turn_id("run-parent", Some("T2"));
+                if settles_inside_budget {
+                    end_later_turn_and_fail_child(&orch, &provider_turn).await;
+                }
+            }
+        };
+        let payloads = [explore_payload("map the fleet")];
+        let budget = Duration::from_millis(if settles_inside_budget { 10_000 } else { 1500 });
+        let (outcome, ()) = tokio::join!(spawn(&orch, &payloads, budget), supersede);
+        let response = outcome.response.expect("a spawned task has blocking text");
+        assert!(
+            response.result.contains("will arrive as a notice"),
+            "{}",
+            response.result
+        );
+        let head = "SELECT current_turn_id FROM jobs WHERE id = 'j-parent'";
+        assert_ne!(text(&orch, head).await.as_deref(), Some("T1"));
+        assert_eq!(
+            text(&orch, "SELECT state FROM turns WHERE id = 'T1'")
+                .await
+                .as_deref(),
+            Some("complete"),
+            "the ended spawning turn is not parked"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            requests.lock().unwrap().iter().all(|request| {
+                request["method"] != "turn/interrupt" && request["params"]["status"] != "paused"
+            }),
+            "the turn now running is neither paused nor interrupted: {:?}",
+            requests.lock().unwrap()
+        );
+        if !settles_inside_budget {
+            assert_eq!(text(&orch, head).await.as_deref(), Some("T2"));
+            end_later_turn_and_fail_child(&orch, &provider_turn).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while count(
+            &orch,
+            "SELECT COUNT(*) FROM turns WHERE predecessor_id = 'T2'",
+        )
+        .await
+            == 0
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the parent was never continued on its real head"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            text(
+                &orch,
+                "SELECT wake || ' ' || content_ref FROM attention_pushes
+                 WHERE recipient = 'j-parent' AND key = 'tasks:T1:wait'"
+            )
+            .await
+            .map(|push| push.starts_with("wake cairn://p/prj/7/1/builder/task/")),
+            Some(true),
+            "the child's settlement reaches the parent as a waking notice"
+        );
+        assert_eq!(successor_count(&orch).await, 0, "T1 was never claimed");
+        assert_ne!(text(&orch, head).await.as_deref(), Some("T1"));
     }
 
     /// An unknown agent creates nothing: every task in the batch is refused,

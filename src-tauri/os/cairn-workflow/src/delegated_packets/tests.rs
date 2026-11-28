@@ -67,6 +67,7 @@ fn packet(id: &str, status: DelegatedStatus, job: Option<&str>) -> DelegatedWork
         task_index: Some(0),
         models: None,
         background: false,
+        owed_by_notice: false,
         created_at: 7,
     }
 }
@@ -152,10 +153,15 @@ async fn a_packet_round_trips_and_keeps_its_prompt_only_while_pending() {
         status: Some(DelegatedStatus::Materialized),
         materialized_node_ids: Some(vec!["delegated-a-agent".to_string()]),
         result_artifact_job_id: Some("j-a".to_string()),
+        owed_by_notice: true,
     };
     assert!(update_db(&db, "e", "a", &change).await.unwrap());
     let stored = get_db(&db, "e", "a").await.unwrap().unwrap();
     assert_eq!(stored.status, DelegatedStatus::Materialized);
+    assert!(
+        stored.owed_by_notice,
+        "an owed result is recorded in the spec"
+    );
     assert_eq!(stored.materialized_node_ids, vec!["delegated-a-agent"]);
     assert_eq!(stored.result_artifact_job_id.as_deref(), Some("j-a"));
     assert_eq!(

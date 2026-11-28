@@ -11,70 +11,143 @@ use crate::orchestrator::attention_push::{
     latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
 };
 
+/// Whether a delegated wait parked the turn that spawned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DelegatedWaitPark {
+    /// The spawning turn heads the job and rests yielded on the wait, so the
+    /// batch's final completion claims it and resumes the parent.
+    Parked,
+    /// The spawning turn no longer owns the job: the provider ended it before
+    /// the inline budget ran out, and a later turn may already head the job.
+    /// Nothing was written. The batch's completion reaches the parent as an
+    /// attention push instead (`unparked_anchor_wake`).
+    Superseded,
+}
+
+/// Where a delegated wait's spawning turn stands, read in one row: the turn's
+/// state and yield reason, but only while it is its job's head.
+const SPAWNING_TURN_AT_HEAD: &str = "SELECT t.state, t.yield_reason
+     FROM jobs j JOIN turns t ON t.id = j.current_turn_id
+     WHERE j.id = ?1 AND t.id = ?2 LIMIT 1";
+
+/// The spawning turn can still be parked on its wait: it heads the job and is
+/// either still running or already yielded on this same wait (a coalesced
+/// second spawn of the same turn).
+fn spawning_turn_can_park(state: &str, yield_reason: Option<&str>) -> bool {
+    state == "running" || (state == "yielded" && yield_reason == Some("dependency_wait"))
+}
+
 pub(super) fn prepare_parent_for_delegated_wait(
     orch: &Orchestrator,
     parent_ctx: &ParentRunContext,
     packet: &crate::models::DelegatedWorkPacket,
-) -> Result<(), String> {
+) -> Result<DelegatedWaitPark, String> {
+    let pred_turn_id = packet
+        .parent_turn_id
+        .as_deref()
+        .ok_or_else(|| "Cannot park delegated wait without a durable parent turn".to_string())?;
+    let db = {
+        let dbs = orch.db.clone();
+        let job_id = parent_ctx.job_id.clone();
+        block_on(async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        })?
+    };
+    // A superseded wait stakes no goal pause: the pause would fence whatever
+    // provider turn the session is running now, not the one that spawned.
+    let standing = block_on({
+        let (db, job, turn) = (
+            db.clone(),
+            parent_ctx.job_id.clone(),
+            pred_turn_id.to_string(),
+        );
+        async move {
+            db.query_opt(SPAWNING_TURN_AT_HEAD, (job, turn), |row| {
+                Ok((row.text(0)?, row.opt_text(1)?))
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    })?;
+    if !standing.is_some_and(|(state, reason)| spawning_turn_can_park(&state, reason.as_deref())) {
+        return Ok(DelegatedWaitPark::Superseded);
+    }
+
     // Native goal continuation is evaluated as soon as Codex observes an idle
     // provider turn. Pause before publishing the yielded predecessor so provider
     // bookkeeping cannot race the canonical completion launcher. There is no
     // successor yet: the final child completion mints and claims it atomically,
     // before delivering the child result and releasing this turn's ownership.
-    {
-        let pred_turn_id = packet.parent_turn_id.as_deref().ok_or_else(|| {
-            "Cannot park delegated wait without a durable parent turn".to_string()
-        })?;
-        crate::backends::stdin::pause_goal_for_durable_wait(
+    let goal_pause = crate::backends::stdin::pause_goal_for_durable_wait(
+        &orch.process_state,
+        &parent_ctx.run_id,
+        PauseIntent::Stake(GoalPause::Owned(GoalPauseOwner::DependencyWait {
+            parked_turn_id: pred_turn_id.to_string(),
+        })),
+    )?;
+    let parked = block_on(prepare_parent_for_delegated_wait_db(
+        db.clone(),
+        pred_turn_id.to_string(),
+        parent_ctx.job_id.clone(),
+    ));
+    if !matches!(parked, Ok(DelegatedWaitPark::Parked)) {
+        // The head moved between the check above and the park, or the park
+        // failed: release the pause staked for a wait that never parked.
+        if let Err(error) = crate::backends::stdin::restore_goal_after_failed_durable_wait(
             &orch.process_state,
             &parent_ctx.run_id,
-            PauseIntent::Stake(GoalPause::Owned(GoalPauseOwner::DependencyWait {
-                parked_turn_id: pred_turn_id.to_string(),
-            })),
-        )?;
-        let db = {
-            let dbs = orch.db.clone();
-            let job_id = parent_ctx.job_id.clone();
-            block_on(async move {
-                crate::execution::routing::owning_db_for_job(&dbs, &job_id)
-                    .await
-                    .map_err(|e| e.to_string())
-            })?
-        };
-        block_on(prepare_parent_for_delegated_wait_db(
-            db.clone(),
-            pred_turn_id.to_string(),
-            parent_ctx.job_id.clone(),
-        ))?;
-        let change = block_on({
-            let db = db.clone();
-            let turn_id = pred_turn_id.to_string();
-            async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
-        })?;
-        let _ = orch.services.emitter.emit("db-change", change);
+            goal_pause,
+        ) {
+            log::warn!(
+                "Could not restore the goal of run {} after its delegated wait did not park: {error}",
+                parent_ctx.run_id
+            );
+        }
+        return parked;
     }
-
-    Ok(())
+    let change = block_on({
+        let db = db.clone();
+        let turn_id = pred_turn_id.to_string();
+        async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
+    Ok(DelegatedWaitPark::Parked)
 }
 
+/// Park the spawning turn on its delegated wait, only while it is still the
+/// job's head. The job's head is never moved here: a turn that already has a
+/// successor must never become the head again, since every continuation builds
+/// on the head and refuses a turn that has one.
 async fn prepare_parent_for_delegated_wait_db(
     db: std::sync::Arc<LocalDb>,
     pred_turn_id: String,
     parent_job_id: String,
-) -> Result<(), String> {
+) -> Result<DelegatedWaitPark, String> {
     db.write(|conn| {
         let pred_turn_id = pred_turn_id.clone();
         let parent_job_id = parent_job_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT state FROM turns WHERE id = ?1 LIMIT 1",
-                    (pred_turn_id.as_str(),),
+                    SPAWNING_TURN_AT_HEAD,
+                    (parent_job_id.as_str(), pred_turn_id.as_str()),
                 )
                 .await?;
-            let turn_state = crate::storage::next_text(&mut rows, 0).await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(DelegatedWaitPark::Superseded);
+            };
+            let (turn_state, yield_reason) = (row.text(0)?, row.opt_text(1)?);
+            drop(rows);
+            if !spawning_turn_can_park(&turn_state, yield_reason.as_deref()) {
+                return Ok(DelegatedWaitPark::Superseded);
+            }
 
-            if matches!(turn_state.as_deref(), Some("running")) {
+            // Yielded, the spawning turn stays the job head for the entire
+            // wait. Publishing a pending dependency_unblock here would expose
+            // an unowned non-terminal turn while children are still running.
+            if turn_state == "running" {
                 let now = chrono::Utc::now().timestamp() as i32;
                 conn.execute(
                     "
@@ -97,45 +170,16 @@ async fn prepare_parent_for_delegated_wait_db(
                 .await?;
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
             }
-
-            let mut session_rows = conn
-                .query(
-                    "SELECT current_session_id FROM jobs WHERE id = ?1 LIMIT 1",
-                    (parent_job_id.as_str(),),
-                )
-                .await?;
-            let session_id = session_rows
-                .next()
-                .await?
-                .map(|row| row.opt_text(0))
-                .transpose()?
-                .flatten();
-            let Some(_session_id) = session_id else {
-                return Ok(());
-            };
-
-            // Keep the yielded predecessor as the job head for the entire wait.
-            // Publishing a pending dependency_unblock here exposes an unowned
-            // non-terminal turn while children are still running.
-            conn.execute(
-                "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2",
-                (pred_turn_id.as_str(), parent_job_id.as_str()),
-            )
-            .await?;
-            // The head is the predecessor this call read, yielded above when
-            // it was running.
-            let head = match turn_state.as_deref() {
-                Some("running") | None => cairn_db::stored_status::jobs::HeadTurn::Idle,
-                Some(state) => cairn_db::stored_status::jobs::HeadTurn::of_state(state),
-            };
+            // The head is the spawning turn, yielded either above or by an
+            // earlier spawn of the same turn.
             let _ = cairn_db::stored_status::jobs::set_head_turn(
                 conn,
                 &parent_job_id,
-                head,
+                cairn_db::stored_status::jobs::HeadTurn::Idle,
                 chrono::Utc::now().timestamp(),
             )
             .await?;
-            Ok(())
+            Ok(DelegatedWaitPark::Parked)
         })
     })
     .await
@@ -369,24 +413,27 @@ enum TaskCompletionOutcome {
     /// Blocking spawn: deliver combined results after atomically claiming the
     /// suspended parent's dependency-unblock boundary.
     Resume(TaskResumeDelivery),
-    /// Background spawn: a `tasks:` attention push was already written for the
-    /// spawning node inside the closure. `wake_idle` says whether the effective
-    /// wake level should nudge an idle spawner now (a passive in-flight push
+    /// A `tasks:` attention push was already written for the spawning node
+    /// inside the closure: for a background spawn, or for a blocking batch
+    /// whose spawning turn is not parked on it. `wake_idle` says whether the
+    /// effective wake level should nudge an idle spawner now (a passive push
     /// never nudges; the completion wake does).
-    BackgroundNotify { recipient: String, wake_idle: bool },
+    Notify { recipient: String, wake_idle: bool },
 }
 
-/// Background-spawn completion handler: notify the spawning node that one of its
-/// fire-and-forget tasks settled, passively while the batch is still in flight
-/// and with a single `wake` when the last sibling settles. This is the
-/// background sibling of the blocking successor-resume path; it never touches a
-/// successor turn or `continue_job_impl`. A workflow spawner is told nothing:
-/// it is not an agent, and it already holds its own wait on each child.
-async fn notify_spawner_after_background_task_completion(
+/// Push-based completion handler: notify the spawning node that one of its
+/// tasks settled, passively while the batch is still in flight and with a
+/// single push at `settled_wake` when the last sibling settles. It serves a
+/// background spawn, and a blocking batch whose spawning turn is no longer
+/// parked on it; it never touches a successor turn or `continue_job_impl`. A
+/// workflow spawner is told nothing: it is not an agent, and it already holds
+/// its own wait on each child.
+async fn notify_spawner_of_task_completion(
     db: &LocalDb,
     execution_id: &str,
     trigger: &crate::models::DelegatedWorkPacket,
     sibling_ids: &[String],
+    settled_wake: Wake,
 ) -> Result<Option<TaskCompletionOutcome>, String> {
     let total = sibling_ids.len();
     let mut terminal_count = 0usize;
@@ -420,7 +467,13 @@ async fn notify_spawner_after_background_task_completion(
         .parent_turn_id
         .as_deref()
         .unwrap_or(trigger.id.as_str());
-    let key = format!("tasks:{anchor}");
+    // A blocking batch and a background batch of the same turn share the
+    // anchor, so the blocking one keys apart: neither push supersedes the other.
+    let key = if trigger.background {
+        format!("tasks:{anchor}")
+    } else {
+        format!("tasks:{anchor}:wait")
+    };
     let settled = terminal_count >= total;
 
     // content_ref: a single-task batch links straight to the task artifact; a
@@ -452,7 +505,7 @@ async fn notify_spawner_after_background_task_completion(
     // last sibling settles. The fingerprint guard below makes a re-finalize
     // after delivery a no-op, so recovery never double-wakes.
     let (wake, fingerprint) = if settled {
-        (Wake::Wake, format!("complete:{total}"))
+        (settled_wake, format!("complete:{total}"))
     } else {
         (Wake::Passive, format!("progress:{terminal_count}/{total}"))
     };
@@ -478,10 +531,123 @@ async fn notify_spawner_after_background_task_completion(
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(Some(TaskCompletionOutcome::BackgroundNotify {
+    Ok(Some(TaskCompletionOutcome::Notify {
         recipient,
         wake_idle: effective.wakes_idle(),
     }))
+}
+
+/// The wake level of the `tasks:` push that delivers a settled batch owed by
+/// notice (`DelegatedWorkPacket::owed_by_notice`) whose claim found no parked
+/// anchor, or `None` when nothing is owed any more.
+///
+/// Only an owed batch comes here, so a batch the spawning call answered inline
+/// is never pushed. A `dependency_unblock` marker after the anchor means a
+/// claim already resumed the parent with the result. Otherwise the parent
+/// moved on, or its turn ended without parking, and the push wakes it; an
+/// operator's stop on the anchor stays honoured, and the push then rides along
+/// passively on the parent's next turn.
+async fn owed_batch_wake(db: &LocalDb, anchor: &str) -> Result<Option<Wake>, String> {
+    let row = db
+        .query_opt(
+            "SELECT t.end_reason,
+                    EXISTS (SELECT 1 FROM turns m
+                            WHERE m.predecessor_id = t.id
+                              AND m.start_reason = 'dependency_unblock')
+             FROM turns t WHERE t.id = ?1",
+            (anchor.to_string(),),
+            |row| Ok((row.opt_text(0)?, row.i64(1)? != 0)),
+        )
+        .await
+        .map_err(|e| format!("Failed to read the delegated wait's anchor: {e}"))?;
+    Ok(match row {
+        Some((_, true)) => None,
+        Some((end_reason, false)) if end_reason.as_deref() == Some("user_stop") => {
+            Some(Wake::Passive)
+        }
+        Some(_) | None => Some(Wake::Wake),
+    })
+}
+
+/// Whether the turn that made a delegated call can still receive its answer:
+/// it heads the job and is running. A read failure answers `true`, which keeps
+/// the inline answer the call would have given anyway.
+pub(super) async fn spawning_turn_receives_answer(
+    db: &LocalDb,
+    parent_job_id: &str,
+    turn_id: &str,
+) -> bool {
+    match db
+        .query_opt(
+            SPAWNING_TURN_AT_HEAD,
+            (parent_job_id.to_string(), turn_id.to_string()),
+            |row| row.text(0),
+        )
+        .await
+    {
+        Ok(state) => state.as_deref() == Some("running"),
+        Err(error) => {
+            log::warn!(
+                "Could not read whether turn {turn_id} still heads job {parent_job_id}: {error}"
+            );
+            true
+        }
+    }
+}
+
+/// Record that the spawning call returned without these children's results,
+/// each `(child job, packet)`. A failed record is logged: that batch's result
+/// then reaches the parent only through a parked turn's claim.
+pub(super) fn mark_owed_by_notice(orch: &Orchestrator, children: Vec<(String, String)>) {
+    for (child_job_id, packet_id) in children {
+        let dbs = orch.db.clone();
+        let child = child_job_id.clone();
+        let marked = block_on(async move {
+            let db = crate::execution::routing::owning_db_for_job(&dbs, &child)
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(execution_id) =
+                select_optional_text(&db, "SELECT execution_id FROM jobs WHERE id = ?1", &child)
+                    .await
+                    .map_err(|e| e.to_string())?
+            else {
+                return Ok(());
+            };
+            cairn_workflow::delegated_packets::update_db(
+                &db,
+                &execution_id,
+                &packet_id,
+                &cairn_workflow::delegated_packets::PacketChange {
+                    owed_by_notice: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        });
+        if let Err(error) = marked {
+            log::warn!("Could not record task {child_job_id}'s result as owed by notice: {error}");
+        }
+    }
+}
+
+/// Deliver a batch now owed by notice if it already settled: a child that
+/// finished before [`mark_owed_by_notice`] found nothing owed and delivered
+/// nothing. A batch still running is a no-op; its last child delivers.
+pub(super) fn deliver_owed_batch_if_settled(orch: Orchestrator, child_job_id: String) {
+    cairn_common::task::spawn(async move {
+        let checked = tokio::task::spawn_blocking(move || {
+            resume_suspended_parent_after_task_completion(&orch, &child_job_id)
+                .map_err(|error| format!("via child {child_job_id}: {error}"))
+        })
+        .await;
+        match checked {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("Owed task delivery check failed {error}"),
+            Err(join_error) => log::warn!("Owed task delivery check panicked: {join_error}"),
+        }
+    });
 }
 
 fn task_tool_result_deliveries(
@@ -842,18 +1008,19 @@ fn resume_parent_after_task_settled(
                 if mode == ResumeMode::Repair {
                     return Ok(None);
                 }
-                return notify_spawner_after_background_task_completion(
+                return notify_spawner_of_task_completion(
                     &db,
                     &execution_id,
                     &refreshed_packet,
                     &sibling_ids,
+                    Wake::Wake,
                 )
                 .await;
             }
 
             let mut grouped_packets = Vec::with_capacity(sibling_ids.len());
-            for packet_id in sibling_ids {
-                let packet = refresh_packet_state(&db, &execution_id, &packet_id)
+            for packet_id in &sibling_ids {
+                let packet = refresh_packet_state(&db, &execution_id, packet_id)
                     .await?
                     .ok_or_else(|| format!("Delegated packet disappeared: {}", packet_id))?;
                 if !matches!(
@@ -888,7 +1055,24 @@ fn resume_parent_after_task_settled(
                 claim_dependency_unblock(&db, &refreshed_packet.parent_job_id, parent_turn_id)
                     .await?
             else {
-                return Ok(None);
+                // No parked anchor to resume. A live completion of a batch the
+                // spawning call did not answer still reaches the parent; a
+                // repair wakes only a parent parked on the anchor.
+                let owed = grouped_packets.iter().any(|packet| packet.owed_by_notice);
+                if mode == ResumeMode::Repair || !owed {
+                    return Ok(None);
+                }
+                let Some(wake) = owed_batch_wake(&db, parent_turn_id).await? else {
+                    return Ok(None);
+                };
+                return notify_spawner_of_task_completion(
+                    &db,
+                    &execution_id,
+                    &refreshed_packet,
+                    &sibling_ids,
+                    wake,
+                )
+                .await;
             };
 
             grouped_packets.sort_by_key(|packet| (packet.task_index, packet.created_at));
@@ -942,25 +1126,21 @@ fn resume_parent_after_task_settled(
     })?;
     let resume = match resume {
         Some(TaskCompletionOutcome::Resume(resume)) => resume,
-        Some(TaskCompletionOutcome::BackgroundNotify {
+        Some(TaskCompletionOutcome::Notify {
             recipient,
             wake_idle,
         }) => {
             orch.notifier.emit_change("attention_pushes");
-            // A settled background batch upgrades to a `wake`; nudge an idle
-            // spawner so it drains the push now. A passive in-flight push
-            // reports `wake_idle == false` and rides along on the next run.
+            // A settled batch upgrades to a `wake`; nudge an idle spawner so
+            // it drains the push now. A passive push reports
+            // `wake_idle == false` and rides along on the next run.
             if wake_idle {
                 if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
                     orch,
                     &recipient,
                     crate::messages::queued::DeliveryUrgency::Steer,
                 ) {
-                    log::warn!(
-                        "background task completion wake for {} failed: {}",
-                        recipient,
-                        e
-                    );
+                    log::warn!("task completion wake for {} failed: {}", recipient, e);
                 }
             }
             return Ok(());
@@ -1840,6 +2020,8 @@ pub(super) mod background_completion_tests {
         )
         .await
         .unwrap();
+        // The parked call returned without the result, as a real park does.
+        super::mark_owed_by_notice(&orch, vec![("j-c1".into(), "pkt-1".into())]);
 
         crate::orchestrator::lifecycle::stop_active_turn_for_run(&orch, "run-parent", true);
         assert_eq!(state_of_turn(&orch.db.local, ANCHOR).await, "cancelled");
@@ -1870,6 +2052,11 @@ pub(super) mod background_completion_tests {
                 .is_none(),
             "operator stop must remain intentional after child completion"
         );
+        // The result still reaches the parent, riding along on its next turn.
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].key, "tasks:T1:wait");
+        assert_eq!(pushes[0].wake, Wake::Passive);
     }
 
     /// One background task settling pushes a single `tasks:` wake to the spawner,

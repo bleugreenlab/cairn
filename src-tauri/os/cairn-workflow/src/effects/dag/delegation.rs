@@ -318,7 +318,7 @@ fn persist_expansion(
                     let change = crate::delegated_packets::PacketChange {
                         status: Some(DelegatedStatus::Materialized),
                         materialized_node_ids: Some(node_ids),
-                        result_artifact_job_id: None,
+                        ..Default::default()
                     };
                     crate::delegated_packets::update(conn, &execution_id, &packet_id, &change)
                         .await?;

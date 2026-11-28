@@ -222,6 +222,7 @@ pub(crate) fn create_or_reuse_task_packet(
         task_index: input.task_index,
         models: input.models.map(<[AllotmentEntry]>::to_vec),
         background: input.background,
+        owed_by_notice: false,
         created_at: chrono::Utc::now().timestamp(),
     };
     (packet, true)
@@ -279,6 +280,7 @@ pub(crate) fn create_call_packet(input: CreateCallPacketInput<'_>) -> DelegatedW
         task_index: input.task_index,
         models: input.models.map(<[AllotmentEntry]>::to_vec),
         background: input.background,
+        owed_by_notice: false,
         created_at: chrono::Utc::now().timestamp(),
     }
 }

@@ -1891,6 +1891,68 @@ async fn reconcile_stale_runs_db(
                 }
             }
 
+            // Upgrade repair: a release whose delegated-wait park pointed the
+            // job's head back at the turn that spawned the wait, after a later
+            // turn had already begun, left the job headed by a turn with a
+            // successor. Every continuation builds on the head and refuses a
+            // turn that has one, so the job could never resume, not even when
+            // messaged. Re-point each such head at the tail of its turn chain.
+            // A sound database selects nothing. Single-table shape, as below.
+            let mut rows = conn
+                .query(
+                    "SELECT j.id, j.current_turn_id
+                     FROM jobs j
+                     WHERE j.status NOT IN ('complete', 'cancelled', 'failed')
+                       AND EXISTS (
+                           SELECT 1 FROM turns s
+                           WHERE s.predecessor_id = j.current_turn_id
+                             AND s.job_id = j.id
+                       )",
+                    (),
+                )
+                .await?;
+            let mut stale_heads = Vec::new();
+            while let Some(row) = rows.next().await? {
+                stale_heads.push((row.text(0)?, row.text(1)?));
+            }
+            drop(rows);
+            for (job_id, head) in &stale_heads {
+                if claimed_job_ids.contains(job_id) {
+                    continue;
+                }
+                let Some(tail) = turn_chain_tail(conn, job_id, head).await? else {
+                    log::warn!("Job {job_id}'s turn chain from {head} does not end; its head is left alone");
+                    continue;
+                };
+                let moved = conn
+                    .execute(
+                        "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2 AND current_turn_id = ?3",
+                        params![tail.id.as_str(), job_id.as_str(), head.as_str()],
+                    )
+                    .await?;
+                if moved != 1 {
+                    continue;
+                }
+                let _ = cairn_db::stored_status::jobs::set_head_turn(
+                    conn,
+                    job_id,
+                    cairn_db::stored_status::jobs::HeadTurn::of(
+                        &tail.state,
+                        &tail.start_reason,
+                        tail.run_id.as_deref(),
+                        tail.end_reason.as_deref(),
+                    ),
+                    now,
+                )
+                .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
+                log::warn!(
+                    "Re-pointed job {job_id}'s head from {head}, which already had a successor, to its latest turn {}",
+                    tail.id
+                );
+                reproject_job_ids.insert(job_id.clone());
+            }
+
             // Select only after stale runs have settled. A predecessor's resume
             // run can be the sole active run hiding a runless pending head; once
             // that run is crashed, the same boot must see and cancel the turn.
@@ -2243,6 +2305,66 @@ async fn reconcile_stale_runs_db(
     })
     .await
     .map_err(CairnError::from)
+}
+
+/// The turn a chain of successors ends on, with the columns its job's stored
+/// head is derived from.
+struct TurnChainTail {
+    id: String,
+    state: String,
+    start_reason: String,
+    run_id: Option<String>,
+    end_reason: Option<String>,
+}
+
+/// More successors than any real turn chain past a misplaced head holds.
+const TURN_CHAIN_WALK_LIMIT: usize = 4096;
+
+/// The tail of `job_id`'s turn chain from `turn_id`: each turn's latest
+/// successor in the job, followed until one has none. `None` when the walk
+/// does not end within [`TURN_CHAIN_WALK_LIMIT`], so a cycle cannot hold
+/// startup.
+async fn turn_chain_tail(
+    conn: &TrackedConnection,
+    job_id: &str,
+    turn_id: &str,
+) -> DbResult<Option<TurnChainTail>> {
+    let mut current = turn_id.to_string();
+    for _ in 0..TURN_CHAIN_WALK_LIMIT {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM turns WHERE predecessor_id = ?1 AND job_id = ?2
+                 ORDER BY sequence DESC, created_at DESC LIMIT 1",
+                params![current.as_str(), job_id],
+            )
+            .await?;
+        let next = match rows.next().await? {
+            Some(row) => Some(row.text(0)?),
+            None => None,
+        };
+        drop(rows);
+        if let Some(next) = next {
+            current = next;
+            continue;
+        }
+        let mut rows = conn
+            .query(
+                "SELECT state, start_reason, run_id, end_reason FROM turns WHERE id = ?1",
+                params![current.as_str()],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        return Ok(Some(TurnChainTail {
+            state: row.text(0)?,
+            start_reason: row.text(1)?,
+            run_id: row.opt_text(2)?,
+            end_reason: row.opt_text(3)?,
+            id: current,
+        }));
+    }
+    Ok(None)
 }
 
 /// Settle one stale run: mark it `crashed` with `exit_reason`, terminalize the
