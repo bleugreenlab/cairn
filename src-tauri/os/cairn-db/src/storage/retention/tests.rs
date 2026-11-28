@@ -1115,8 +1115,7 @@ async fn insert_check_request(
     id: &str,
     consumer: &str,
     state: &str,
-    accepted_s: i64,
-    settled_s: i64,
+    (accepted_s, settled_s): (i64, i64),
     job: &str,
     context_bytes: usize,
 ) {
@@ -1169,7 +1168,7 @@ async fn settled_check_requests_and_delivered_waves_go_and_live_ones_never_do() 
     insert_wave(&db, "wave-delivered-old", "consumer", true, days(2)).await;
     insert_wave(&db, "wave-delivered-new", "consumer", true, NOW - HOUR).await;
     let request = |id, consumer, state, accepted, settled, job| {
-        insert_check_request(&db, id, consumer, state, accepted, settled, job, 16)
+        insert_check_request(&db, id, consumer, state, (accepted, settled), job, 16)
     };
     request(
         "write-old",
@@ -1266,7 +1265,16 @@ async fn oversized_settled_check_requests_go_in_pages_of_a_few_megabytes() {
     seed_owners(&db).await;
     let old = NOW - 3 * DAY_S;
     for id in ["a", "b", "c"] {
-        insert_check_request(&db, id, "write", "recorded", old, old, "consumer", 3 << 20).await;
+        insert_check_request(
+            &db,
+            id,
+            "write",
+            "recorded",
+            (old, old),
+            "consumer",
+            3 << 20,
+        )
+        .await;
     }
 
     let report = run(&db, UNBOUNDED, &[Eviction::SettledCheckRequests]).await;
